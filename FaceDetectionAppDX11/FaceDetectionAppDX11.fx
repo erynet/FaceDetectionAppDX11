@@ -1,11 +1,12 @@
-Texture2D txBuf0 : register(t0);
-Texture2D txBuf1 : register(t1);
-SamplerState samLinear : register(s0);
+//Texture2D txBuf0 : register(t0);
+//Texture2D txBuf1 : register(t1);
+Texture2D tx : register(t0);
+SamplerState samLin : register(s0);
 
-cbuffer cbTextureIndex : register(b0)
-{
-	float4 txIdx;
-};
+//cbuffer cbTextureIndex : register(b0)
+//{
+//	float4 txIdx;
+//};
 
 struct VS_INPUT
 {
@@ -36,8 +37,10 @@ PS_INPUT VS(VS_INPUT input)
 //--------------------------------------------------------------------------------------
 float4 PS(PS_INPUT input) : SV_Target
 {
-	if (txIdx.x == 0.0)
+	/*if (txIdx.x == 0.0)
 		return txBuf0.Sample(samLinear, input.Tex);
 	else
-		return txBuf1.Sample(samLinear, input.Tex);
+		return txBuf1.Sample(samLinear, input.Tex);*/
+
+	return tx.Sample(samLin, input.Tex);
 }

@@ -21,6 +21,7 @@
 #define SAFE_DELETE_ARRAY(p) if (p != nullptr) { delete[] p; p = nullptr; }
 #define SAFE_DELETE_PVECTOR(v) for (int i = 0; i < v.size(); i++) { delete v[i]; v[i] = nullptr; }
 #define SAFE_RELEASE(p) if (p != nullptr) { p->Release(); p = nullptr; }
+#define SAFE_RELEASE_PARRAY(arr,n) for (int i = 0; i < n; i++) { if (arr[i] != nullptr) { arr[i]->Release(); arr[i] = nullptr;} }
 
 #define BUF_SIZE			3
 #define SHM_REQ_SIZE		(8+(512*512*3))
@@ -55,7 +56,6 @@ struct _SimpleVertex
 	XMFLOAT2 Tex;
 };
 
-struct _CBTextureIndex { XMFLOAT4 mTxIdx; };
 
 int gcd(int n1, int n2) { return (n2 == 0) ? n1 : gcd(n2, n1 % n2);}
 
@@ -70,7 +70,6 @@ public:
 		, m_pReqMv(nullptr)
 		, m_pResMv(nullptr)
 		, m_pResBk(nullptr)
-		//, m_mmrEvtGrab(NULL)
 		, m_mmrEvtRetrieve(NULL)
 	{
 		m_pCap = new cv::VideoCapture(devIdx);
@@ -81,9 +80,6 @@ public:
 		m_pCap->set(cv::CAP_PROP_FRAME_HEIGHT, camMaxHeight);
 		m_pCap->set(cv::CAP_PROP_FPS, camFps);
 		m_pCap->set(cv::CAP_PROP_ZOOM, 0.0);
-
-		//if (!InitializeCriticalSectionAndSpinCount(&m_csVCap, 0x00000400))
-		//	return;
 
 		m_hReqShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_REQ_SIZE, _T("__SHM_REQ_IMG"));
 		m_hResShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_RES_SIZE, _T("__SHM_RES_RECT"));
@@ -121,8 +117,6 @@ public:
 		SAFE_DELETE(m_pCap);
 		SAFE_FREE(m_pResBk);
 		SAFE_DELETE_PVECTOR(m_vMatBuf);
-
-		//DeleteCriticalSection(&m_csVCap);
 	}
 	bool IsWorking() const
 	{
@@ -169,13 +163,6 @@ public:
 
 		double fps = GetFPS();
 
-		/*m_mmrEvtGrab = timeSetEvent(
-			1000 / (fps * 1.1),
-			mmtRes,
-			MMTCB_HighSpeedGrab,
-			reinterpret_cast<DWORD_PTR>(this),
-			TIME_PERIODIC);*/
-
 		m_mmrEvtRetrieve = timeSetEvent(
 			1000 / (fps * 0.95),
 			mmtRes,
@@ -183,7 +170,6 @@ public:
 			reinterpret_cast<DWORD_PTR>(this),
 			TIME_PERIODIC);
 
-		//if ((m_mmrEvtGrab == NULL) || (m_mmrEvtRetrieve == NULL))
 		if (m_mmrEvtRetrieve == NULL)
 			return false;
 		return true;
@@ -191,8 +177,6 @@ public:
 	
 	void Stop()
 	{
-		//if (m_mmrEvtGrab != NULL)
-		//	timeKillEvent(m_mmrEvtGrab);
 		if (m_mmrEvtRetrieve != NULL)
 			timeKillEvent(m_mmrEvtRetrieve);
 
@@ -200,16 +184,6 @@ public:
 		ZeroMemory(&m_FrameLayout, sizeof(m_FrameLayout));
 	}
 private:
-	//static void CALLBACK MMTCB_HighSpeedGrab(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
-	//{
-	//	CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
-	//	if (!p->IsWorking())
-	//		return;
-
-	//	//EnterCriticalSection(&(p->m_csVCap));
-	//	p->m_pCap->grab();
-	//	//LeaveCriticalSection(&(p->m_csVCap));
-	//}
 	static void CALLBACK MMTCB_Retrieve(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
 	{
 		CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
@@ -218,10 +192,8 @@ private:
 
 		int curIdx = p->m_aiFrameIdx;
 		int nextSlot = (curIdx + 1) % BUF_SIZE;
-		//EnterCriticalSection(&(p->m_csVCap));
 		bool bRetSuccess = p->m_pCap->read(*(p->m_vMatBuf[nextSlot]));
-		//LeaveCriticalSection(&(p->m_csVCap));
-
+		
 		if (!bRetSuccess)
 			return;
 
@@ -244,8 +216,6 @@ private:
 	HANDLE					m_hReqShm, m_hResShm;
 	void					*m_pReqMv, *m_pResMv;
 	char*					m_pResBk;
-	//CRITICAL_SECTION		m_csVCap;
-	//MMRESULT				m_mmrEvtGrab, m_mmrEvtRetrieve;
 	MMRESULT				m_mmrEvtRetrieve;
 };
 
@@ -264,20 +234,17 @@ public:
 		, m_pRenderTargetView(nullptr)
 		, m_pDepthStencil(nullptr)
 		, m_pDepthStencilView(nullptr)
-		, m_pTx0(nullptr)
-		, m_pTx1(nullptr)
-		, m_pTx0RV(nullptr)
-		, m_pTx1RV(nullptr)
 		, m_pVertexShader(nullptr)
 		, m_pPixelShader(nullptr)
 		, m_pVertexBuffer(nullptr)
 		, m_pIndexBuffer(nullptr)
-		, m_pCBTextureIndex(nullptr)
 		, m_pSamplerLinear(nullptr)
 		, m_srcWidth(srcWidth)
 		, m_srcHeight(srcHeight)
+		, m_frameIdx(0)
+		, m_frameUpdateCount(0)
 		, m_hWnd(NULL)
-		, m_pMatTmp(nullptr)
+		, m_pMatTmp(new cv::Mat(srcHeight, srcWidth, CV_8UC4))
 	{}
 	~FaceDetectionAppDX11()
 	{
@@ -288,11 +255,8 @@ public:
 		}
 
 		SAFE_RELEASE(m_pSamplerLinear);
-		SAFE_RELEASE(m_pCBTextureIndex);
-		SAFE_RELEASE(m_pTx0RV);
-		SAFE_RELEASE(m_pTx1RV);
-		SAFE_RELEASE(m_pTx0);
-		SAFE_RELEASE(m_pTx1);
+		SAFE_RELEASE_PARRAY(m_paTx, 2);
+		SAFE_RELEASE_PARRAY(m_paTxRV, 2);
 		SAFE_RELEASE(m_pVertexBuffer);
 		SAFE_RELEASE(m_pIndexBuffer);
 		SAFE_RELEASE(m_pVertexLayout);
@@ -591,16 +555,6 @@ public:
 		// Set primitive topology
 		m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-		bd.Usage = D3D11_USAGE_DEFAULT;
-		bd.ByteWidth = sizeof(_CBTextureIndex);
-		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-		bd.CPUAccessFlags = 0;
-		hr = m_pd3dDevice->CreateBuffer(&bd, nullptr, &m_pCBTextureIndex);
-		if (FAILED(hr))
-			return hr;
-
-		m_cbTI.mTxIdx.x = 0.0;
-
 		// Create the sample state
 		D3D11_SAMPLER_DESC sampDesc;
 		ZeroMemory(&sampDesc, sizeof(sampDesc));
@@ -611,6 +565,7 @@ public:
 		sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
 		sampDesc.MinLOD = 0;
 		sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+
 		hr = m_pd3dDevice->CreateSamplerState(&sampDesc, &m_pSamplerLinear);
 		if (FAILED(hr))
 			return hr;
@@ -620,7 +575,7 @@ public:
 		texDesc.Height = m_srcHeight;
 		texDesc.MipLevels = 1;
 		texDesc.ArraySize = 1;
-		texDesc.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
+		texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 		texDesc.SampleDesc.Count = 1;
 		texDesc.SampleDesc.Quality = 0;
 		texDesc.Usage = D3D11_USAGE_DYNAMIC;
@@ -628,31 +583,30 @@ public:
 		texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 		texDesc.MiscFlags = 0;
 
-		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &m_pTx0);
+		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &(m_paTx[0]));
 		if (FAILED(hr))
 			return hr;
-
-		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &m_pTx1);
+		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &(m_paTx[1]));
 		if (FAILED(hr))
 			return hr;
 
 		// g_pTx0RV, g_pTx1RV
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
 		ZeroMemory(&srvDesc, sizeof(D3D11_SHADER_RESOURCE_VIEW_DESC));
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.ViewDimension = D3D_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Format = texDesc.Format;
 		srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
 		
-		hr = m_pd3dDevice->CreateShaderResourceView(m_pTx0, &srvDesc, &m_pTx0RV);
+		hr = m_pd3dDevice->CreateShaderResourceView(m_paTx[0], &srvDesc, &(m_paTxRV[0]));
 		if (FAILED(hr))
 			return hr;
-
-		hr = m_pd3dDevice->CreateShaderResourceView(m_pTx1, &srvDesc, &m_pTx1RV);
+		hr = m_pd3dDevice->CreateShaderResourceView(m_paTx[1], &srvDesc, &(m_paTxRV[1]));
 		if (FAILED(hr))
 			return hr;
 
 		m_hWnd = hWnd;
 		m_frameIdx = 0;
+		m_frameUpdateCount = 0;
 
 		return S_OK;
 	}
@@ -666,41 +620,27 @@ public:
 	}
 	void Render(const _FrameLayout& frame)
 	{
+		if (frame.pMat == nullptr)
+			return;
+
 		if (frame.idx > m_frameIdx)
 		{
 			unsigned char* pSrc = frame.pMat->data;
 			if (frame.pMat->type() == CV_8UC3)
 			{
-				if (m_pMatTmp == nullptr)
-					m_pMatTmp = new cv::Mat(m_srcHeight, m_srcWidth, CV_8UC4);
 				cv::cvtColor(*(frame.pMat), *m_pMatTmp, CV_BGR2BGRA);
 				pSrc = m_pMatTmp->data;
 			}
 			m_frameIdx = frame.idx;
+			m_frameUpdateCount++;
 
 			D3D11_MAPPED_SUBRESOURCE mapTx;
 			ZeroMemory(&mapTx, sizeof(D3D11_MAPPED_SUBRESOURCE));
-
-			if (m_frameIdx % 2 == 0)
+			HRESULT hr = m_pImmediateContext->Map(m_paTx[m_frameUpdateCount % 2], 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
+			if (SUCCEEDED(hr))
 			{
-				HRESULT hr = m_pImmediateContext->Map(m_pTx1, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
-				if (SUCCEEDED(hr))
-				{
-					memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
-					m_pImmediateContext->Unmap(m_pTx1, 0);
-					m_cbTI.mTxIdx.x = 1.0;
-				}
-			}
-			else
-			{
-				HRESULT hr = m_pImmediateContext->Map(m_pTx0, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
-				if (SUCCEEDED(hr))
-				{
-					memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
-					m_pImmediateContext->Unmap(m_pTx0, 0);
-
-					m_cbTI.mTxIdx.x = 0.0;
-				}
+				memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
+				m_pImmediateContext->Unmap(m_paTx[m_frameUpdateCount % 2], 0);
 			}
 		}
 
@@ -710,16 +650,10 @@ public:
 		// Clear the depth buffer to 1.0 (max depth)
 		m_pImmediateContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
 
-		if (m_frameIdx % 2 == 0)
-			m_pImmediateContext->PSSetShaderResources(1, 1, &m_pTx1RV);
-		else
-			m_pImmediateContext->PSSetShaderResources(0, 1, &m_pTx0RV);
-
-		m_pImmediateContext->UpdateSubresource(m_pCBTextureIndex, 0, nullptr, &m_cbTI, 0, 0);
+		m_pImmediateContext->PSSetShaderResources(0, 1, &(m_paTxRV[m_frameUpdateCount % 2]));
 
 		// Render a triangle
 		m_pImmediateContext->VSSetShader(m_pVertexShader, nullptr, 0);
-		m_pImmediateContext->PSSetConstantBuffers(0, 1, &m_pCBTextureIndex);
 		m_pImmediateContext->PSSetShader(m_pPixelShader, nullptr, 0);
 		m_pImmediateContext->PSSetSamplers(0, 1, &m_pSamplerLinear);
 		m_pImmediateContext->DrawIndexed(6, 0, 0);
@@ -776,17 +710,16 @@ private:
 	ID3D11RenderTargetView*		m_pRenderTargetView;
 	ID3D11Texture2D*            m_pDepthStencil;
 	ID3D11DepthStencilView*     m_pDepthStencilView;
-	ID3D11Texture2D             *m_pTx0, *m_pTx1;
-	ID3D11ShaderResourceView    *m_pTx0RV, *m_pTx1RV;
+	ID3D11Texture2D*            m_paTx[2];
+	ID3D11ShaderResourceView*   m_paTxRV[2];
 	ID3D11VertexShader*			m_pVertexShader;
 	ID3D11PixelShader*			m_pPixelShader;
 	ID3D11InputLayout*			m_pVertexLayout;
-	ID3D11Buffer				*m_pVertexBuffer, *m_pIndexBuffer, *m_pCBTextureIndex;
+	ID3D11Buffer				*m_pVertexBuffer, *m_pIndexBuffer;
 	ID3D11SamplerState*			m_pSamplerLinear;
-	_CBTextureIndex				m_cbTI;
 private:
 	int							m_srcWidth, m_srcHeight;
-	int							m_frameIdx;
+	int							m_frameIdx, m_frameUpdateCount;
 	HWND						m_hWnd;
 	cv::Mat*					m_pMatTmp;
 };
@@ -882,11 +815,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 		{
 			TranslateMessage(&msg);
 			DispatchMessage(&msg);
+
+			continue;
 		}
-		else
-		{
-			pFaceDetectionAppDX11->Render(pCamDrv->GetFrame());
-		}
+		
+		pFaceDetectionAppDX11->Render(pCamDrv->GetFrame());
 	}
 
 	// Dealloc FaceDetectionAppDX11 obj
