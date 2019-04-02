@@ -1,0 +1,10 @@
+*.opendb
+*.db
+*.vcxproj.user
+*.tmp
+.vs
+/ipch
+/bin
+__exclude
+Debug
+Release
