@@ -12,11 +12,17 @@
 #include "resource.h"
 #include <tchar.h>
 
+#include <numeric>
+#include <vector>
+#include <atomic>
+
 #define SAFE_FREE(p) if (p != nullptr) { ::free(p); p = nullptr; }
 #define SAFE_DELETE(p) if (p != nullptr) { delete p; p = nullptr; }
 #define SAFE_DELETE_ARRAY(p) if (p != nullptr) { delete[] p; p = nullptr; }
+#define SAFE_DELETE_PVECTOR(v) for (int i = 0; i < v.size(); i++) { delete v[i]; v[i] = nullptr; }
 #define SAFE_RELEASE(p) if (p != nullptr) { p->Release(); p = nullptr; }
 
+#define BUF_SIZE			3
 #define SHM_REQ_SIZE		(8+(512*512*3))
 #define SHM_RES_SIZE		(2+((4*6)*32)+6)
 
@@ -25,6 +31,12 @@ using namespace DirectX;
 //--------------------------------------------------------------------------------------
 // Structures
 //--------------------------------------------------------------------------------------
+struct _FrameLayout
+{
+	int idx;
+	cv::Mat* pMat;
+};
+
 struct _ShmReqLayout
 {
 	__int64 ts;
@@ -44,6 +56,198 @@ struct _SimpleVertex
 };
 
 struct _CBTextureIndex { XMFLOAT4 mTxIdx; };
+
+int gcd(int n1, int n2) { return (n2 == 0) ? n1 : gcd(n2, n1 % n2);}
+
+class CamDrv
+{
+public:
+	CamDrv(int devIdx, int evalReqSide, int camMaxWidth = 1920, int camMaxHeight = 1080, double camFps = 30.0)
+		: m_pCap(nullptr)
+		, m_evalReqSide(evalReqSide)
+		, m_hReqShm(NULL)
+		, m_hResShm(NULL)
+		, m_pReqMv(nullptr)
+		, m_pResMv(nullptr)
+		, m_pResBk(nullptr)
+		//, m_mmrEvtGrab(NULL)
+		, m_mmrEvtRetrieve(NULL)
+	{
+		m_pCap = new cv::VideoCapture(devIdx);
+		if ((m_pCap == nullptr) || (!m_pCap->isOpened()))
+			return;
+
+		m_pCap->set(cv::CAP_PROP_FRAME_WIDTH, camMaxWidth);
+		m_pCap->set(cv::CAP_PROP_FRAME_HEIGHT, camMaxHeight);
+		m_pCap->set(cv::CAP_PROP_FPS, camFps);
+		m_pCap->set(cv::CAP_PROP_ZOOM, 0.0);
+
+		//if (!InitializeCriticalSectionAndSpinCount(&m_csVCap, 0x00000400))
+		//	return;
+
+		m_hReqShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_REQ_SIZE, _T("__SHM_REQ_IMG"));
+		m_hResShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_RES_SIZE, _T("__SHM_RES_RECT"));
+
+		if ((m_hReqShm == NULL) || (m_hResShm == NULL))
+			return;
+
+		m_pReqMv = ::MapViewOfFile(m_hReqShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_REQ_SIZE);
+		m_pResMv = ::MapViewOfFile(m_hResShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_RES_SIZE);
+
+		if ((m_pReqMv == nullptr) || (m_pResMv == nullptr))
+			return;
+
+		_ShmReqLayout* pShmReq = reinterpret_cast<_ShmReqLayout*>(m_pReqMv);
+		memset(pShmReq->data, 0, SHM_REQ_SIZE);
+		_ShmResLayout* pShmRes = reinterpret_cast<_ShmResLayout*>(m_pResMv);
+		memset(pShmRes->data, 0, SHM_RES_SIZE);
+
+		m_pResBk = static_cast<char*>(::malloc(SHM_RES_SIZE));
+
+		m_camPropHeight = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_HEIGHT));
+		m_camPropWidth = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_WIDTH));
+		m_camPropFPS = m_pCap->get(cv::CAP_PROP_FPS);
+		
+		for (int i = 0; i < BUF_SIZE; i++)
+			m_vMatBuf.push_back(new cv::Mat(m_camPropHeight, m_camPropWidth, CV_8UC3));
+
+		m_aiFrameIdx = 0;
+		ZeroMemory(&m_FrameLayout, sizeof(m_FrameLayout));
+	}
+	~CamDrv()
+	{
+		Stop();
+
+		SAFE_DELETE(m_pCap);
+		SAFE_FREE(m_pResBk);
+		SAFE_DELETE_PVECTOR(m_vMatBuf);
+
+		//DeleteCriticalSection(&m_csVCap);
+	}
+	bool IsWorking() const
+	{
+		if ((m_pCap == nullptr) || (!m_pCap->isOpened()) ||
+			(m_hReqShm == NULL) || (m_hResShm == NULL) ||
+			(m_pReqMv == nullptr) || (m_pResMv == nullptr) ||
+			(m_vMatBuf.size() == 0))
+			return false;
+		return true;
+	}
+	int GetWidth() const
+	{
+		if (!IsWorking())
+			return 0;
+		return m_camPropWidth;
+	}
+	int GetHeight() const
+	{
+		if (!IsWorking())
+			return 0;
+		return m_camPropHeight;
+	}
+	double GetFPS() const
+	{
+		if (!IsWorking())
+			return 0;
+		return m_camPropFPS;
+	}
+	const _FrameLayout& GetFrame() const
+	{
+		return m_FrameLayout;
+	}
+public:
+	bool Run()
+	{
+		if (!IsWorking())
+			return false;
+
+		// Initialize multimedia timer
+		TIMECAPS tc;
+		timeGetDevCaps(&tc, sizeof(TIMECAPS));
+		unsigned int mmtRes = MIN(MAX(tc.wPeriodMin, 0), tc.wPeriodMax);
+		timeBeginPeriod(mmtRes);
+
+		double fps = GetFPS();
+
+		/*m_mmrEvtGrab = timeSetEvent(
+			1000 / (fps * 1.1),
+			mmtRes,
+			MMTCB_HighSpeedGrab,
+			reinterpret_cast<DWORD_PTR>(this),
+			TIME_PERIODIC);*/
+
+		m_mmrEvtRetrieve = timeSetEvent(
+			1000 / (fps * 0.95),
+			mmtRes,
+			MMTCB_Retrieve,
+			reinterpret_cast<DWORD_PTR>(this),
+			TIME_PERIODIC);
+
+		//if ((m_mmrEvtGrab == NULL) || (m_mmrEvtRetrieve == NULL))
+		if (m_mmrEvtRetrieve == NULL)
+			return false;
+		return true;
+	}
+	
+	void Stop()
+	{
+		//if (m_mmrEvtGrab != NULL)
+		//	timeKillEvent(m_mmrEvtGrab);
+		if (m_mmrEvtRetrieve != NULL)
+			timeKillEvent(m_mmrEvtRetrieve);
+
+		m_aiFrameIdx = 0;
+		ZeroMemory(&m_FrameLayout, sizeof(m_FrameLayout));
+	}
+private:
+	//static void CALLBACK MMTCB_HighSpeedGrab(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
+	//{
+	//	CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
+	//	if (!p->IsWorking())
+	//		return;
+
+	//	//EnterCriticalSection(&(p->m_csVCap));
+	//	p->m_pCap->grab();
+	//	//LeaveCriticalSection(&(p->m_csVCap));
+	//}
+	static void CALLBACK MMTCB_Retrieve(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
+	{
+		CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
+		if (!p->IsWorking())
+			return;
+
+		int curIdx = p->m_aiFrameIdx;
+		int nextSlot = (curIdx + 1) % BUF_SIZE;
+		//EnterCriticalSection(&(p->m_csVCap));
+		bool bRetSuccess = p->m_pCap->read(*(p->m_vMatBuf[nextSlot]));
+		//LeaveCriticalSection(&(p->m_csVCap));
+
+		if (!bRetSuccess)
+			return;
+
+		p->m_aiFrameIdx++;
+
+		p->m_FrameLayout.idx = p->m_aiFrameIdx;
+		p->m_FrameLayout.pMat = p->m_vMatBuf[nextSlot];
+
+		// TO DO
+	}
+private:
+	cv::VideoCapture*		m_pCap;
+	int						m_evalReqSide;
+	int						m_camPropWidth, m_camPropHeight;
+	double					m_camPropFPS;
+	std::vector<cv::Mat*>	m_vMatBuf;
+	std::atomic<int>		m_aiFrameIdx;
+	_FrameLayout			m_FrameLayout;
+private:
+	HANDLE					m_hReqShm, m_hResShm;
+	void					*m_pReqMv, *m_pResMv;
+	char*					m_pResBk;
+	//CRITICAL_SECTION		m_csVCap;
+	//MMRESULT				m_mmrEvtGrab, m_mmrEvtRetrieve;
+	MMRESULT				m_mmrEvtRetrieve;
+};
 
 class FaceDetectionAppDX11
 {
@@ -74,10 +278,7 @@ public:
 		, m_srcHeight(srcHeight)
 		, m_hWnd(NULL)
 		, m_pMatTmp(nullptr)
-	{
-		if (!InitializeCriticalSectionAndSpinCount(&m_csVCap, 0x00000400))
-			return;
-	}
+	{}
 	~FaceDetectionAppDX11()
 	{
 		if (m_pImmediateContext)
@@ -109,8 +310,6 @@ public:
 
 		m_hWnd = NULL;
 		SAFE_DELETE(m_pMatTmp);
-
-		DeleteCriticalSection(&m_csVCap);
 	}
 	bool Attach(HWND hWnd)
 	{
@@ -232,7 +431,6 @@ public:
 			hr = dxgiFactory->CreateSwapChain(m_pd3dDevice, &sd, &m_pSwapChain);
 		}
 
-		// Note this tutorial doesn't handle full-screen swapchains so we block the ALT+ENTER shortcut
 		//dxgiFactory->MakeWindowAssociation( g_hWnd, DXGI_MWA_NO_ALT_ENTER );
 
 		dxgiFactory->Release();
@@ -403,11 +601,6 @@ public:
 
 		m_cbTI.mTxIdx.x = 0.0;
 
-		//// Load the Texture
-		//hr = CreateDDSTextureFromFile(g_pd3dDevice, L"seafloor.dds", nullptr, &g_pTextureRV);
-		//if (FAILED(hr))
-		//	return hr;
-
 		// Create the sample state
 		D3D11_SAMPLER_DESC sampDesc;
 		ZeroMemory(&sampDesc, sizeof(sampDesc));
@@ -427,8 +620,6 @@ public:
 		texDesc.Height = m_srcHeight;
 		texDesc.MipLevels = 1;
 		texDesc.ArraySize = 1;
-		//texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		//texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 		texDesc.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
 		texDesc.SampleDesc.Count = 1;
 		texDesc.SampleDesc.Quality = 0;
@@ -444,20 +635,6 @@ public:
 		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &m_pTx1);
 		if (FAILED(hr))
 			return hr;
-
-		/*ZeroMemory(&g_mapTx0, sizeof(D3D11_MAPPED_SUBRESOURCE));
-		hr = m_pImmediateContext->Map(m_pTx0, 0, D3D11_MAP_WRITE_DISCARD, 0, &g_mapTx0);
-		if (FAILED(hr))
-			return hr;
-		memcpy(m_mapTx0.pData, m_mat0.data, (TX_IMG_WIDTH * TX_IMG_HEIGHT * 4));
-		m_pImmediateContext->Unmap(m_pTx0, 0);
-
-		ZeroMemory(&g_mapTx1, sizeof(D3D11_MAPPED_SUBRESOURCE));
-		hr = m_pImmediateContext->Map(m_pTx1, 0, D3D11_MAP_WRITE_DISCARD, 0, &g_mapTx1);
-		if (FAILED(hr))
-			return hr;
-		memcpy(g_mapTx1.pData, m_mat1.data, (TX_IMG_WIDTH * TX_IMG_HEIGHT * 4));
-		m_pImmediateContext->Unmap(m_pTx1, 0);*/
 
 		// g_pTx0RV, g_pTx1RV
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
@@ -475,6 +652,7 @@ public:
 			return hr;
 
 		m_hWnd = hWnd;
+		m_frameIdx = 0;
 
 		return S_OK;
 	}
@@ -486,103 +664,74 @@ public:
 	{
 
 	}
-	void Render()
+	void Render(const _FrameLayout& frame)
 	{
-		EnterCriticalSection(&m_csVCap);
+		if (frame.idx > m_frameIdx)
+		{
+			unsigned char* pSrc = frame.pMat->data;
+			if (frame.pMat->type() == CV_8UC3)
+			{
+				if (m_pMatTmp == nullptr)
+					m_pMatTmp = new cv::Mat(m_srcHeight, m_srcWidth, CV_8UC4);
+				cv::cvtColor(*(frame.pMat), *m_pMatTmp, CV_BGR2BGRA);
+				pSrc = m_pMatTmp->data;
+			}
+			m_frameIdx = frame.idx;
+
+			D3D11_MAPPED_SUBRESOURCE mapTx;
+			ZeroMemory(&mapTx, sizeof(D3D11_MAPPED_SUBRESOURCE));
+
+			if (m_frameIdx % 2 == 0)
+			{
+				HRESULT hr = m_pImmediateContext->Map(m_pTx1, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
+				if (SUCCEEDED(hr))
+				{
+					memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
+					m_pImmediateContext->Unmap(m_pTx1, 0);
+					m_cbTI.mTxIdx.x = 1.0;
+				}
+			}
+			else
+			{
+				HRESULT hr = m_pImmediateContext->Map(m_pTx0, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
+				if (SUCCEEDED(hr))
+				{
+					memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
+					m_pImmediateContext->Unmap(m_pTx0, 0);
+
+					m_cbTI.mTxIdx.x = 0.0;
+				}
+			}
+		}
+
 		// Clear the back buffer 
 		m_pImmediateContext->ClearRenderTargetView(m_pRenderTargetView, Colors::Black);
 
 		// Clear the depth buffer to 1.0 (max depth)
-		//m_pImmediateContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
+		m_pImmediateContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
 
-		//if (m_cbTI.mTxIdx.x == 0.0)
-		m_pImmediateContext->PSSetShaderResources(0, 1, &m_pTx0RV);
-		//else
-		m_pImmediateContext->PSSetShaderResources(1, 1, &m_pTx1RV);
-		
-		//g_cbTI.mTxIdx.x = (g_cbTI.mTxIdx.x == 0.0) ? 1.0 : 0.0;
-		//g_cbTI.mTxIdx.x++;
+		if (m_frameIdx % 2 == 0)
+			m_pImmediateContext->PSSetShaderResources(1, 1, &m_pTx1RV);
+		else
+			m_pImmediateContext->PSSetShaderResources(0, 1, &m_pTx0RV);
+
 		m_pImmediateContext->UpdateSubresource(m_pCBTextureIndex, 0, nullptr, &m_cbTI, 0, 0);
-		//LeaveCriticalSection(&m_csVCap);
-
 
 		// Render a triangle
 		m_pImmediateContext->VSSetShader(m_pVertexShader, nullptr, 0);
 		m_pImmediateContext->PSSetConstantBuffers(0, 1, &m_pCBTextureIndex);
 		m_pImmediateContext->PSSetShader(m_pPixelShader, nullptr, 0);
-		//g_pImmediateContext->Draw( 6, 0 );
 		m_pImmediateContext->PSSetSamplers(0, 1, &m_pSamplerLinear);
 		m_pImmediateContext->DrawIndexed(6, 0, 0);
 
-		//LeaveCriticalSection(&m_csVCap);
-
 		// Present the information rendered to the back buffer to the front buffer (the screen)
 		m_pSwapChain->Present(1, 0);
-
-		LeaveCriticalSection(&m_csVCap);
-	}
-	FaceDetectionAppDX11& operator<<(const cv::Mat& buf)
-	{
-		unsigned char* pSrc = buf.data;
-		if (buf.type() == CV_8UC3)
-		{
-			if (m_pMatTmp == nullptr)
-				m_pMatTmp = new cv::Mat(m_srcHeight, m_srcWidth, CV_8UC4);
-			cv::cvtColor(buf, *m_pMatTmp, CV_RGB2RGBA);
-			pSrc = m_pMatTmp->data;
-		}
-		
-		D3D11_MAPPED_SUBRESOURCE mapTx;
-		ZeroMemory(&mapTx, sizeof(D3D11_MAPPED_SUBRESOURCE));
-
-		EnterCriticalSection(&m_csVCap);
-		if (m_cbTI.mTxIdx.x == 0.0)
-		{
-			HRESULT hr = m_pImmediateContext->Map(m_pTx1, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
-			if (SUCCEEDED(hr))
-			//if (SUCCEEDED(m_pImmediateContext->Map(m_pTx1, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapTx)))
-			{
-				memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
-				m_pImmediateContext->Unmap(m_pTx1, 0);
-
-				m_cbTI.mTxIdx.x = 1.0;
-			}
-		}
-		else
-		{
-			HRESULT hr = m_pImmediateContext->Map(m_pTx0, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
-			if (SUCCEEDED(hr))
-			//if (SUCCEEDED(m_pImmediateContext->Map(m_pTx0, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx)))
-			{
-				memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
-				m_pImmediateContext->Unmap(m_pTx0, 0);
-
-				m_cbTI.mTxIdx.x = 0.0;
-			}
-		}
-		LeaveCriticalSection(&m_csVCap);
-
-		/*ZeroMemory(&g_mapTx0, sizeof(D3D11_MAPPED_SUBRESOURCE));
-		hr = m_pImmediateContext->Map(m_pTx0, 0, D3D11_MAP_WRITE_DISCARD, 0, &g_mapTx0);
-		if (FAILED(hr))
-		return hr;
-		memcpy(m_mapTx0.pData, m_mat0.data, (TX_IMG_WIDTH * TX_IMG_HEIGHT * 4));
-		m_pImmediateContext->Unmap(m_pTx0, 0);
-
-		ZeroMemory(&g_mapTx1, sizeof(D3D11_MAPPED_SUBRESOURCE));
-		hr = m_pImmediateContext->Map(m_pTx1, 0, D3D11_MAP_WRITE_DISCARD, 0, &g_mapTx1);
-		if (FAILED(hr))
-		return hr;
-		memcpy(g_mapTx1.pData, m_mat1.data, (TX_IMG_WIDTH * TX_IMG_HEIGHT * 4));
-		m_pImmediateContext->Unmap(m_pTx1, 0);*/
-
-		return *this;
 	}
 private:
-	HRESULT CompileShader(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
+	/*HRESULT CompileShader(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
 	{
 		return S_OK;
-	}
+	}*/
 	HRESULT CompileShaderFromFile(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
 	{
 		HRESULT hr = S_OK;
@@ -629,7 +778,6 @@ private:
 	ID3D11DepthStencilView*     m_pDepthStencilView;
 	ID3D11Texture2D             *m_pTx0, *m_pTx1;
 	ID3D11ShaderResourceView    *m_pTx0RV, *m_pTx1RV;
-	//D3D11_MAPPED_SUBRESOURCE	m_mapTx0, m_mapTx1;
 	ID3D11VertexShader*			m_pVertexShader;
 	ID3D11PixelShader*			m_pPixelShader;
 	ID3D11InputLayout*			m_pVertexLayout;
@@ -638,177 +786,9 @@ private:
 	_CBTextureIndex				m_cbTI;
 private:
 	int							m_srcWidth, m_srcHeight;
+	int							m_frameIdx;
 	HWND						m_hWnd;
-	CRITICAL_SECTION			m_csVCap;
 	cv::Mat*					m_pMatTmp;
-	
-};
-
-class CamDrv
-{
-public:
-	CamDrv(int devIdx, int evalReqSide, int camMaxWidth = 1920, int camMaxHeight = 1080, double camFps = 30.0)
-		: m_pCap(nullptr)
-		, m_evalReqSide(evalReqSide)
-		, m_hReqShm(NULL)
-		, m_hResShm(NULL)
-		, m_pReqMv(nullptr)
-		, m_pResMv(nullptr)
-		, m_pResBk(nullptr)
-		, m_pFDADX11(nullptr)
-		, m_mmrEvtGrab(NULL)
-		, m_mmrEvtRetrieve(NULL)
-	{
-		m_pCap = new cv::VideoCapture(devIdx);
-		if ((m_pCap == nullptr) || (!m_pCap->isOpened()))
-			return;
-
-		m_pCap->set(cv::CAP_PROP_FRAME_WIDTH, camMaxWidth);
-		m_pCap->set(cv::CAP_PROP_FRAME_HEIGHT, camMaxHeight);
-		m_pCap->set(cv::CAP_PROP_FPS, camFps);
-		m_pCap->set(cv::CAP_PROP_ZOOM, 0.0);
-
-		if (!InitializeCriticalSectionAndSpinCount(&m_csVCap, 0x00000400))
-			return;
-
-		m_hReqShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_REQ_SIZE, _T("__SHM_REQ_IMG"));
-		m_hResShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_RES_SIZE, _T("__SHM_RES_RECT"));
-
-		if ((m_hReqShm == NULL) || (m_hResShm == NULL))
-			return;
-
-		m_pReqMv = ::MapViewOfFile(m_hReqShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_REQ_SIZE);
-		m_pResMv = ::MapViewOfFile(m_hResShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_RES_SIZE);
-
-		if ((m_pReqMv == nullptr) || (m_pResMv == nullptr))
-			return;
-
-		_ShmReqLayout* pShmReq = reinterpret_cast<_ShmReqLayout*>(m_pReqMv);
-		memset(pShmReq->data, 0, SHM_REQ_SIZE);
-		_ShmResLayout* pShmRes = reinterpret_cast<_ShmResLayout*>(m_pResMv);
-		memset(pShmRes->data, 0, SHM_RES_SIZE);
-
-		m_pResBk = static_cast<char*>(::malloc(SHM_RES_SIZE));
-		m_pMatTmp = new cv::Mat(static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_HEIGHT)), static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_WIDTH)), CV_8UC3);
-
-	}
-	~CamDrv()
-	{
-		SAFE_DELETE(m_pCap);
-		SAFE_DELETE(m_pMatTmp);
-		SAFE_FREE(m_pResBk);
-
-		DeleteCriticalSection(&m_csVCap);
-	}
-	bool IsWorking()
-	{
-		if ((m_pCap == nullptr) || (!m_pCap->isOpened()) || 
-			(m_hReqShm == NULL) || (m_hResShm == NULL) || 
-			(m_pReqMv == nullptr) || (m_pResMv == nullptr) || 
-			(m_pMatTmp == nullptr))
-			return false;
-		return true;
-	}
-	int GetWidth()
-	{
-		if (!IsWorking())
-			return 0;
-		return static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_WIDTH));
-	}
-	int GetHeight()
-	{
-		if (!IsWorking())
-			return 0;
-		return static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_HEIGHT));
-	}
-	int GetFPS()
-	{
-		if (!IsWorking())
-			return 0;
-		return static_cast<int>(m_pCap->get(cv::CAP_PROP_FPS));
-	}
-public:
-	bool Run(FaceDetectionAppDX11* pDx)
-	{
-		if ((pDx == nullptr) || (!IsWorking()))
-			return false;
-		m_pFDADX11 = pDx;
-
-		// Initialize multimedia timer
-		TIMECAPS tc;
-		timeGetDevCaps(&tc, sizeof(TIMECAPS));
-		unsigned int mmtRes = MIN(MAX(tc.wPeriodMin, 0), tc.wPeriodMax);
-		timeBeginPeriod(mmtRes);
-
-		int fps = GetFPS();
-
-		m_mmrEvtGrab = timeSetEvent(
-			1000 / (fps * 4),
-			mmtRes,
-			MMTCB_HighSpeedGrab,
-			reinterpret_cast<DWORD_PTR>(this),
-			TIME_PERIODIC);
-
-		m_mmrEvtRetrieve = timeSetEvent(
-			1000 / fps,
-			mmtRes,
-			MMTCB_Retrieve,
-			reinterpret_cast<DWORD_PTR>(this),
-			TIME_PERIODIC);
-
-		if ((m_mmrEvtGrab == NULL) || (m_mmrEvtRetrieve == NULL))
-			return false;
-		return true;
-	}
-	void Stop()
-	{
-		if (m_mmrEvtGrab != NULL)
-			timeKillEvent(m_mmrEvtGrab);
-		if (m_mmrEvtRetrieve != NULL)
-			timeKillEvent(m_mmrEvtRetrieve);
-
-		m_pFDADX11 = nullptr;
-	}
-private:
-	static void CALLBACK MMTCB_HighSpeedGrab(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
-	{
-		CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
-		if (!p->IsWorking())
-			return;
-
-		EnterCriticalSection(&(p->m_csVCap));
-		p->m_pCap->grab();
-		LeaveCriticalSection(&(p->m_csVCap));
-	}
-	static void CALLBACK MMTCB_Retrieve(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
-	{
-		CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
-		if ((p->m_pFDADX11 == nullptr) || !p->IsWorking())
-			return;
-
-		EnterCriticalSection(&(p->m_csVCap));
-		bool bRetSuccess = p->m_pCap->retrieve(*(p->m_pMatTmp));
-		LeaveCriticalSection(&(p->m_csVCap));
-
-		if (!bRetSuccess)
-			return;
-
-		(*p->m_pFDADX11) << *(p->m_pMatTmp);
-
-		// TO DO
-	}
-private:
-	cv::VideoCapture*		m_pCap;
-	int						m_evalReqSide;
-	cv::Mat*				m_pMatTmp;
-private:
-	HANDLE					m_hReqShm, m_hResShm;
-	void					*m_pReqMv, *m_pResMv;
-	char*					m_pResBk;
-	CRITICAL_SECTION		m_csVCap;
-	MMRESULT				m_mmrEvtGrab, m_mmrEvtRetrieve;
-private:
-	FaceDetectionAppDX11	*m_pFDADX11;
 };
 
 
@@ -869,8 +849,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 		return E_FAIL;
 
 	// Check & Initialize WebCam
-	CamDrv* pWebCamDrv = new CamDrv(0, 320);
-	if (!pWebCamDrv->IsWorking())
+	CamDrv* pCamDrv = new CamDrv(0, 320);
+	if (!pCamDrv->IsWorking())
 		return E_FAIL;
 	
 	// Create window
@@ -885,11 +865,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 		return E_FAIL;
 
 	// Alloc FaceDetectionAppDX11 obj
-	FaceDetectionAppDX11* pFaceDetectionAppDX11 = new FaceDetectionAppDX11(pWebCamDrv->GetWidth(), pWebCamDrv->GetHeight());
+	FaceDetectionAppDX11* pFaceDetectionAppDX11 = new FaceDetectionAppDX11(pCamDrv->GetWidth(), pCamDrv->GetHeight());
 	if (FAILED(pFaceDetectionAppDX11->Attach(hWnd)))
 		return E_FAIL;
 
-	if (!pWebCamDrv->Run(pFaceDetectionAppDX11))
+	if (!pCamDrv->Run())
 		return E_FAIL;
 
 	ShowWindow(hWnd, nCmdShow);
@@ -905,16 +885,16 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 		}
 		else
 		{
-			pFaceDetectionAppDX11->Render();
+			pFaceDetectionAppDX11->Render(pCamDrv->GetFrame());
 		}
 	}
 
 	// Dealloc FaceDetectionAppDX11 obj
 	// CleanUp WebCam
-	pWebCamDrv->Stop();
+	pCamDrv->Stop();
 
 	SAFE_DELETE(pFaceDetectionAppDX11);
-	SAFE_DELETE(pWebCamDrv);
+	SAFE_DELETE(pCamDrv);
 
 	return (int)msg.wParam;
 }

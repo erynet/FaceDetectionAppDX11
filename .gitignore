@@ -2,6 +2,7 @@
 *.db
 *.vcxproj.user
 *.tmp
+*.aps
 .vs
 /ipch
 /bin
