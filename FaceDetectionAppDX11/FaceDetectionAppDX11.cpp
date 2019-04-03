@@ -57,7 +57,7 @@ struct _SimpleVertex
 };
 
 
-int gcd(int n1, int n2) { return (n2 == 0) ? n1 : gcd(n2, n1 % n2);}
+int ___GCD(int n1, int n2) { return (n2 == 0) ? n1 : ___GCD(n2, n1 % n2);}
 
 class CamDrv
 {
@@ -239,8 +239,8 @@ public:
 		, m_pVertexBuffer(nullptr)
 		, m_pIndexBuffer(nullptr)
 		, m_pSamplerLinear(nullptr)
-		, m_srcWidth(srcWidth)
-		, m_srcHeight(srcHeight)
+		, m_sourceWidth(srcWidth)
+		, m_sourceHeight(srcHeight)
 		, m_frameIdx(0)
 		, m_frameUpdateCount(0)
 		, m_hWnd(NULL)
@@ -278,11 +278,6 @@ public:
 	bool Attach(HWND hWnd)
 	{
 		HRESULT hr = S_OK;
-
-		RECT rc;
-		GetClientRect(hWnd, &rc);
-		UINT width = rc.right - rc.left;
-		UINT height = rc.bottom - rc.top;
 
 		UINT createDeviceFlags = 0;
 #ifdef _DEBUG
@@ -325,6 +320,12 @@ public:
 		if (FAILED(hr))
 			return hr;
 
+
+		RECT rc;
+		GetClientRect(hWnd, &rc);
+		UINT renderWidth = rc.right - rc.left;
+		UINT renderHeight = rc.bottom - rc.top;
+
 		// Obtain DXGI factory from device (since we used nullptr for pAdapter above)
 		IDXGIFactory1* dxgiFactory = nullptr;
 		{
@@ -359,8 +360,8 @@ public:
 
 			DXGI_SWAP_CHAIN_DESC1 sd;
 			ZeroMemory(&sd, sizeof(sd));
-			sd.Width = width;
-			sd.Height = height;
+			sd.Width = renderWidth;
+			sd.Height = renderHeight;
 			sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			sd.SampleDesc.Count = 1;
 			sd.SampleDesc.Quality = 0;
@@ -381,8 +382,8 @@ public:
 			DXGI_SWAP_CHAIN_DESC sd;
 			ZeroMemory(&sd, sizeof(sd));
 			sd.BufferCount = 1;
-			sd.BufferDesc.Width = width;
-			sd.BufferDesc.Height = height;
+			sd.BufferDesc.Width = renderWidth;
+			sd.BufferDesc.Height = renderHeight;
 			sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			sd.BufferDesc.RefreshRate.Numerator = 60;
 			sd.BufferDesc.RefreshRate.Denominator = 1;
@@ -416,8 +417,8 @@ public:
 		// Create depth stencil texture
 		D3D11_TEXTURE2D_DESC descDepth;
 		ZeroMemory(&descDepth, sizeof(descDepth));
-		descDepth.Width = width;
-		descDepth.Height = height;
+		descDepth.Width = renderWidth;
+		descDepth.Height = renderHeight;
 		descDepth.MipLevels = 1;
 		descDepth.ArraySize = 1;
 		descDepth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
@@ -445,8 +446,8 @@ public:
 
 		// Setup the viewport
 		D3D11_VIEWPORT vp;
-		vp.Width = (FLOAT)width;
-		vp.Height = (FLOAT)height;
+		vp.Width = (FLOAT)renderWidth;
+		vp.Height = (FLOAT)renderHeight;
 		vp.MinDepth = 0.0f;
 		vp.MaxDepth = 1.0f;
 		vp.TopLeftX = 0;
@@ -507,13 +508,35 @@ public:
 		if (FAILED(hr))
 			return hr;
 
+		int sourceResGCD = ___GCD(m_sourceWidth, m_sourceHeight);
+		int renderResGCD = ___GCD(renderWidth, renderHeight);
+
+		int sourceResWR = m_sourceWidth / sourceResGCD;
+		int sourceResHR = m_sourceHeight / sourceResGCD;
+		int renderResWR = renderWidth / renderResGCD;
+		int renderResHR = renderHeight / renderResGCD;
+
+		float wMargin = 0.0f;
+		float hMargin = 0.0f;
+
+		if ((sourceResWR != renderResWR) || (sourceResHR != renderResHR))
+		{
+			float sourceRatio = (float)sourceResWR / (float)sourceResHR;
+			float renderRatio = (float)renderResWR / (float)renderResHR;
+
+			if (sourceRatio > renderRatio)
+				hMargin = 1.0f - (renderRatio / sourceRatio);
+			else if (sourceRatio < renderRatio)
+				wMargin = 1.0f - (sourceRatio / renderRatio);
+		}
+
 		// Create vertex buffer
 		_SimpleVertex vertices[] =
 		{
-			{ XMFLOAT3(-1.0f, -1.0f, 1.0f), XMFLOAT2(0.0f, 1.0f) },
-			{ XMFLOAT3(1.0f, 1.0f, 1.0f), XMFLOAT2(1.0f, 0.0f) },
-			{ XMFLOAT3(-1.0f, 1.0f, 1.0f), XMFLOAT2(0.0f, 0.0f) },
-			{ XMFLOAT3(1.0f, -1.0f, 1.0f), XMFLOAT2(1.0f, 1.0f) },
+			{ XMFLOAT3(-1.0f + wMargin, -1.0f + hMargin, 1.0f), XMFLOAT2(0.0f, 1.0f) },
+			{ XMFLOAT3(1.0f - wMargin, 1.0f - hMargin, 1.0f), XMFLOAT2(1.0f, 0.0f) },
+			{ XMFLOAT3(-1.0f + wMargin, 1.0f - hMargin, 1.0f), XMFLOAT2(0.0f, 0.0f) },
+			{ XMFLOAT3(1.0f - wMargin, -1.0f + hMargin, 1.0f), XMFLOAT2(1.0f, 1.0f) },
 		};
 
 		D3D11_BUFFER_DESC bd;
@@ -571,8 +594,8 @@ public:
 			return hr;
 
 		D3D11_TEXTURE2D_DESC texDesc;
-		texDesc.Width = m_srcWidth;
-		texDesc.Height = m_srcHeight;
+		texDesc.Width = m_sourceWidth;
+		texDesc.Height = m_sourceHeight;
 		texDesc.MipLevels = 1;
 		texDesc.ArraySize = 1;
 		texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -639,7 +662,7 @@ public:
 			HRESULT hr = m_pImmediateContext->Map(m_paTx[m_frameUpdateCount % 2], 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
 			if (SUCCEEDED(hr))
 			{
-				memcpy(mapTx.pData, pSrc, (m_srcWidth * m_srcHeight * 4));
+				memcpy(mapTx.pData, pSrc, (m_sourceWidth * m_sourceHeight * 4));
 				m_pImmediateContext->Unmap(m_paTx[m_frameUpdateCount % 2], 0);
 			}
 		}
@@ -718,7 +741,7 @@ private:
 	ID3D11Buffer				*m_pVertexBuffer, *m_pIndexBuffer;
 	ID3D11SamplerState*			m_pSamplerLinear;
 private:
-	int							m_srcWidth, m_srcHeight;
+	int							m_sourceWidth, m_sourceHeight;
 	int							m_frameIdx, m_frameUpdateCount;
 	HWND						m_hWnd;
 	cv::Mat*					m_pMatTmp;
@@ -788,7 +811,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 	
 	// Create window
 	HINSTANCE hInst = hInstance;
-	RECT rc = { 0, 0, 1280, 720 };
+	RECT rc = { 0, 0, 1920, 1080 };
 	AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
 	HWND hWnd = CreateWindow(L"FaceDetectionAppDX11Class", L"Sualab FaceDetectionApp(DX11)",
 		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
