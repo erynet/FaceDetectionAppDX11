@@ -27,6 +27,8 @@
 #define SHM_REQ_SIZE		(8+(512*512*3))
 #define SHM_RES_SIZE		(2+((4*6)*32)+6)
 
+#define MAX_HLSL_LEN		2048
+
 using namespace DirectX;
 
 //--------------------------------------------------------------------------------------
@@ -80,7 +82,7 @@ public:
 		m_pCap->set(cv::CAP_PROP_FRAME_HEIGHT, camMaxHeight);
 		m_pCap->set(cv::CAP_PROP_FPS, camFps);
 		m_pCap->set(cv::CAP_PROP_ZOOM, 0.0);
-
+		
 		m_hReqShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_REQ_SIZE, _T("__SHM_REQ_IMG"));
 		m_hResShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_RES_SIZE, _T("__SHM_RES_RECT"));
 
@@ -103,7 +105,7 @@ public:
 		m_camPropHeight = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_HEIGHT));
 		m_camPropWidth = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_WIDTH));
 		m_camPropFPS = m_pCap->get(cv::CAP_PROP_FPS);
-		
+
 		for (int i = 0; i < BUF_SIZE; i++)
 			m_vMatBuf.push_back(new cv::Mat(m_camPropHeight, m_camPropWidth, CV_8UC3));
 
@@ -145,6 +147,22 @@ public:
 			return 0;
 		return m_camPropFPS;
 	}
+	void IncFocus()
+	{
+		m_pCap->set(cv::CAP_PROP_FOCUS, m_pCap->get(cv::CAP_PROP_FOCUS) + 1.0);
+	}
+	void DecFocus()
+	{
+		m_pCap->set(cv::CAP_PROP_FOCUS, m_pCap->get(cv::CAP_PROP_FOCUS) - 1.0);
+	}
+	void IncExposure()
+	{
+		m_pCap->set(cv::CAP_PROP_EXPOSURE, m_pCap->get(cv::CAP_PROP_EXPOSURE) + 1.0);
+	}
+	void DecExposure()
+	{
+		m_pCap->set(cv::CAP_PROP_EXPOSURE, m_pCap->get(cv::CAP_PROP_EXPOSURE) - 1.0);
+	}
 	const _FrameLayout& GetFrame() const
 	{
 		return m_FrameLayout;
@@ -164,7 +182,7 @@ public:
 		double fps = GetFPS();
 
 		m_mmrEvtRetrieve = timeSetEvent(
-			1000 / (fps * 0.95),
+			1000 / (fps * 1.01),
 			mmtRes,
 			MMTCB_Retrieve,
 			reinterpret_cast<DWORD_PTR>(this),
@@ -192,6 +210,7 @@ private:
 
 		int curIdx = p->m_aiFrameIdx;
 		int nextSlot = (curIdx + 1) % BUF_SIZE;
+
 		bool bRetSuccess = p->m_pCap->read(*(p->m_vMatBuf[nextSlot]));
 		
 		if (!bRetSuccess)
@@ -222,7 +241,7 @@ private:
 class FaceDetectionAppDX11
 {
 public:
-	FaceDetectionAppDX11(int srcWidth, int srcHeight)
+	FaceDetectionAppDX11(HINSTANCE hInstance, int srcWidth, int srcHeight)
 		: m_driverType(D3D_DRIVER_TYPE_NULL)
 		, m_featureLevel(D3D_FEATURE_LEVEL_11_0)
 		, m_pd3dDevice(nullptr)
@@ -238,44 +257,16 @@ public:
 		, m_pPixelShader(nullptr)
 		, m_pVertexBuffer(nullptr)
 		, m_pIndexBuffer(nullptr)
-		, m_pSamplerLinear(nullptr)
+		, m_pLinearSampler(nullptr)
 		, m_sourceWidth(srcWidth)
 		, m_sourceHeight(srcHeight)
 		, m_frameIdx(0)
 		, m_frameUpdateCount(0)
+		, m_hInst(hInstance)
 		, m_hWnd(NULL)
 		, m_pMatTmp(new cv::Mat(srcHeight, srcWidth, CV_8UC4))
-	{}
-	~FaceDetectionAppDX11()
-	{
-		if (m_pImmediateContext)
-		{
-			m_pImmediateContext->ClearState();
-			m_pImmediateContext = nullptr;
-		}
-
-		SAFE_RELEASE(m_pSamplerLinear);
-		SAFE_RELEASE_PARRAY(m_paTx, 2);
-		SAFE_RELEASE_PARRAY(m_paTxRV, 2);
-		SAFE_RELEASE(m_pVertexBuffer);
-		SAFE_RELEASE(m_pIndexBuffer);
-		SAFE_RELEASE(m_pVertexLayout);
-		SAFE_RELEASE(m_pVertexShader);
-		SAFE_RELEASE(m_pPixelShader);
-		SAFE_RELEASE(m_pDepthStencil);
-		SAFE_RELEASE(m_pDepthStencilView);
-		SAFE_RELEASE(m_pRenderTargetView);
-		SAFE_RELEASE(m_pSwapChain1);
-		SAFE_RELEASE(m_pSwapChain);
-		SAFE_RELEASE(m_pImmediateContext1);
-		SAFE_RELEASE(m_pImmediateContext);
-		SAFE_RELEASE(m_pd3dDevice1);
-		SAFE_RELEASE(m_pd3dDevice);
-
-		m_hWnd = NULL;
-		SAFE_DELETE(m_pMatTmp);
-	}
-	bool Attach(HWND hWnd)
+		, m_bCreateDeviceSuccess(false)
+		, m_bAttachSuccess(false)
 	{
 		HRESULT hr = S_OK;
 
@@ -318,8 +309,160 @@ public:
 				break;
 		}
 		if (FAILED(hr))
-			return hr;
+			return;
 
+		// Compile the vertex shader
+		ID3DBlob* pVSBlob = nullptr;
+		//hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", "VS", "vs_4_0", &pVSBlob);
+		hr = CompileShader("VS", "vs_4_0", &pVSBlob);
+		if (FAILED(hr))
+		{
+			MessageBox(nullptr,
+				L"The FX cannot be compiled.  Please run this executable from the directory that contains the FX file.", L"Error", MB_OK);
+			return;
+		}
+
+		// Create the vertex shader
+		hr = m_pd3dDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, &m_pVertexShader);
+		if (FAILED(hr))
+		{
+			pVSBlob->Release();
+			return;
+		}
+
+		// Define the input layout
+		D3D11_INPUT_ELEMENT_DESC layout[] =
+		{
+			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		};
+		UINT numElements = ARRAYSIZE(layout);
+
+		// Create the input layout
+		hr = m_pd3dDevice->CreateInputLayout(layout, numElements, pVSBlob->GetBufferPointer(),
+			pVSBlob->GetBufferSize(), &m_pVertexLayout);
+		pVSBlob->Release();
+		if (FAILED(hr))
+			return;
+
+		// Set the input layout
+		m_pImmediateContext->IASetInputLayout(m_pVertexLayout);
+
+		// Compile the pixel shader
+		ID3DBlob* pPSBlob = nullptr;
+		//hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", "PS", "ps_4_0", &pPSBlob);
+		hr = CompileShader("PS", "ps_4_0", &pPSBlob);
+		if (FAILED(hr))
+		{
+			MessageBox(nullptr,
+				L"The FX cannot be compiled.  Please run this executable from the directory that contains the FX file.", L"Error", MB_OK);
+			return;
+		}
+
+		// Create the pixel shader
+		hr = m_pd3dDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pPixelShader);
+		pPSBlob->Release();
+		if (FAILED(hr))
+			return;
+
+		// Create the sample state
+		D3D11_SAMPLER_DESC sampDesc;
+		ZeroMemory(&sampDesc, sizeof(sampDesc));
+		sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+		sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+		sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+		sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		sampDesc.MinLOD = 0;
+		sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+
+		hr = m_pd3dDevice->CreateSamplerState(&sampDesc, &m_pLinearSampler);
+		if (FAILED(hr))
+			return;
+
+		D3D11_TEXTURE2D_DESC texDesc;
+		texDesc.Width = m_sourceWidth;
+		texDesc.Height = m_sourceHeight;
+		texDesc.MipLevels = 1;
+		texDesc.ArraySize = 1;
+		texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		texDesc.SampleDesc.Count = 1;
+		texDesc.SampleDesc.Quality = 0;
+		texDesc.Usage = D3D11_USAGE_DYNAMIC;
+		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		texDesc.MiscFlags = 0;
+
+		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &(m_paTx[0]));
+		if (FAILED(hr))
+			return;
+		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &(m_paTx[1]));
+		if (FAILED(hr))
+			return;
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+		ZeroMemory(&srvDesc, sizeof(D3D11_SHADER_RESOURCE_VIEW_DESC));
+		srvDesc.ViewDimension = D3D_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Format = texDesc.Format;
+		srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
+
+		hr = m_pd3dDevice->CreateShaderResourceView(m_paTx[0], &srvDesc, &(m_paTxRV[0]));
+		if (FAILED(hr))
+			return;
+		hr = m_pd3dDevice->CreateShaderResourceView(m_paTx[1], &srvDesc, &(m_paTxRV[1]));
+		if (FAILED(hr))
+			return;
+
+		m_bCreateDeviceSuccess = true;
+	}
+	~FaceDetectionAppDX11()
+	{
+		m_bCreateDeviceSuccess = false;
+		m_bAttachSuccess = false;
+
+		SAFE_RELEASE(m_pVertexBuffer);
+		SAFE_RELEASE(m_pIndexBuffer);
+		SAFE_RELEASE(m_pDepthStencil);
+		SAFE_RELEASE(m_pDepthStencilView);
+		SAFE_RELEASE(m_pRenderTargetView);
+		SAFE_RELEASE(m_pSwapChain1);
+		SAFE_RELEASE(m_pSwapChain);
+
+		if (m_pImmediateContext)
+		{
+			m_pImmediateContext->ClearState();
+			m_pImmediateContext = nullptr;
+		}
+
+		SAFE_RELEASE(m_pLinearSampler);
+		SAFE_RELEASE_PARRAY(m_paTx, 2);
+		SAFE_RELEASE_PARRAY(m_paTxRV, 2);
+		SAFE_RELEASE(m_pVertexLayout);
+		SAFE_RELEASE(m_pVertexShader);
+		SAFE_RELEASE(m_pPixelShader);
+		SAFE_RELEASE(m_pImmediateContext1);
+		SAFE_RELEASE(m_pImmediateContext);
+		SAFE_RELEASE(m_pd3dDevice1);
+		SAFE_RELEASE(m_pd3dDevice);
+
+		m_hWnd = NULL;
+		SAFE_DELETE(m_pMatTmp);
+	}
+	HRESULT Attach(HWND hWnd)
+	{
+		if (!m_bCreateDeviceSuccess)
+			return S_FALSE;
+		m_bAttachSuccess = false;
+
+		SAFE_RELEASE(m_pVertexBuffer);
+		SAFE_RELEASE(m_pIndexBuffer);
+		SAFE_RELEASE(m_pDepthStencil);
+		SAFE_RELEASE(m_pDepthStencilView);
+		SAFE_RELEASE(m_pRenderTargetView);
+		SAFE_RELEASE(m_pSwapChain1);
+		SAFE_RELEASE(m_pSwapChain);
+
+		HRESULT hr = S_OK;
 
 		RECT rc;
 		GetClientRect(hWnd, &rc);
@@ -454,60 +597,6 @@ public:
 		vp.TopLeftY = 0;
 		m_pImmediateContext->RSSetViewports(1, &vp);
 
-		//LoadString()
-
-		// Compile the vertex shader
-		ID3DBlob* pVSBlob = nullptr;
-		hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", "VS", "vs_4_0", &pVSBlob);
-		if (FAILED(hr))
-		{
-			MessageBox(nullptr,
-				L"The FX file cannot be compiled.  Please run this executable from the directory that contains the FX file.", L"Error", MB_OK);
-			return hr;
-		}
-
-		// Create the vertex shader
-		hr = m_pd3dDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, &m_pVertexShader);
-		if (FAILED(hr))
-		{
-			pVSBlob->Release();
-			return hr;
-		}
-
-		// Define the input layout
-		D3D11_INPUT_ELEMENT_DESC layout[] =
-		{
-			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-		};
-		UINT numElements = ARRAYSIZE(layout);
-
-		// Create the input layout
-		hr = m_pd3dDevice->CreateInputLayout(layout, numElements, pVSBlob->GetBufferPointer(),
-			pVSBlob->GetBufferSize(), &m_pVertexLayout);
-		pVSBlob->Release();
-		if (FAILED(hr))
-			return hr;
-
-		// Set the input layout
-		m_pImmediateContext->IASetInputLayout(m_pVertexLayout);
-
-		// Compile the pixel shader
-		ID3DBlob* pPSBlob = nullptr;
-		hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", "PS", "ps_4_0", &pPSBlob);
-		if (FAILED(hr))
-		{
-			MessageBox(nullptr,
-				L"The FX file cannot be compiled.  Please run this executable from the directory that contains the FX file.", L"Error", MB_OK);
-			return hr;
-		}
-
-		// Create the pixel shader
-		hr = m_pd3dDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pPixelShader);
-		pPSBlob->Release();
-		if (FAILED(hr))
-			return hr;
-
 		int sourceResGCD = ___GCD(m_sourceWidth, m_sourceHeight);
 		int renderResGCD = ___GCD(renderWidth, renderHeight);
 
@@ -578,58 +667,10 @@ public:
 		// Set primitive topology
 		m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-		// Create the sample state
-		D3D11_SAMPLER_DESC sampDesc;
-		ZeroMemory(&sampDesc, sizeof(sampDesc));
-		sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-		sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
-		sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
-		sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
-		sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-		sampDesc.MinLOD = 0;
-		sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
-
-		hr = m_pd3dDevice->CreateSamplerState(&sampDesc, &m_pSamplerLinear);
-		if (FAILED(hr))
-			return hr;
-
-		D3D11_TEXTURE2D_DESC texDesc;
-		texDesc.Width = m_sourceWidth;
-		texDesc.Height = m_sourceHeight;
-		texDesc.MipLevels = 1;
-		texDesc.ArraySize = 1;
-		texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-		texDesc.SampleDesc.Count = 1;
-		texDesc.SampleDesc.Quality = 0;
-		texDesc.Usage = D3D11_USAGE_DYNAMIC;
-		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-		texDesc.MiscFlags = 0;
-
-		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &(m_paTx[0]));
-		if (FAILED(hr))
-			return hr;
-		hr = m_pd3dDevice->CreateTexture2D(&texDesc, 0, &(m_paTx[1]));
-		if (FAILED(hr))
-			return hr;
-
-		// g_pTx0RV, g_pTx1RV
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
-		ZeroMemory(&srvDesc, sizeof(D3D11_SHADER_RESOURCE_VIEW_DESC));
-		srvDesc.ViewDimension = D3D_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Format = texDesc.Format;
-		srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
-		
-		hr = m_pd3dDevice->CreateShaderResourceView(m_paTx[0], &srvDesc, &(m_paTxRV[0]));
-		if (FAILED(hr))
-			return hr;
-		hr = m_pd3dDevice->CreateShaderResourceView(m_paTx[1], &srvDesc, &(m_paTxRV[1]));
-		if (FAILED(hr))
-			return hr;
-
 		m_hWnd = hWnd;
 		m_frameIdx = 0;
 		m_frameUpdateCount = 0;
+		m_bAttachSuccess = true;
 
 		return S_OK;
 	}
@@ -643,6 +684,9 @@ public:
 	}
 	void Render(const _FrameLayout& frame)
 	{
+		if (!m_bAttachSuccess)
+			return;
+
 		if (frame.pMat == nullptr)
 			return;
 
@@ -678,20 +722,21 @@ public:
 		// Render a triangle
 		m_pImmediateContext->VSSetShader(m_pVertexShader, nullptr, 0);
 		m_pImmediateContext->PSSetShader(m_pPixelShader, nullptr, 0);
-		m_pImmediateContext->PSSetSamplers(0, 1, &m_pSamplerLinear);
+		m_pImmediateContext->PSSetSamplers(0, 1, &m_pLinearSampler);
 		m_pImmediateContext->DrawIndexed(6, 0, 0);
 
 		// Present the information rendered to the back buffer to the front buffer (the screen)
 		m_pSwapChain->Present(1, 0);
 	}
 private:
-	/*HRESULT CompileShader(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
-	{
-		return S_OK;
-	}*/
-	HRESULT CompileShaderFromFile(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
+	HRESULT CompileShader(LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
 	{
 		HRESULT hr = S_OK;
+
+		CHAR hlsl[MAX_HLSL_LEN];
+		ZeroMemory(hlsl, sizeof(hlsl));
+		LoadStringA(m_hInst, IDS_HLSL, hlsl, MAX_HLSL_LEN);
+		size_t hlslLen = strlen(hlsl);
 
 		DWORD dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
@@ -704,9 +749,8 @@ private:
 		// Disable optimizations to further improve shader debugging
 		dwShaderFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
-
 		ID3DBlob* pErrorBlob = nullptr;
-		hr = D3DCompileFromFile(szFileName, nullptr, nullptr, szEntryPoint, szShaderModel,
+		hr = D3DCompile(hlsl, hlslLen, NULL, nullptr, nullptr, szEntryPoint, szShaderModel,
 			dwShaderFlags, 0, ppBlobOut, &pErrorBlob);
 		if (FAILED(hr))
 		{
@@ -721,6 +765,38 @@ private:
 
 		return S_OK;
 	}
+//	HRESULT CompileShaderFromFile(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
+//	{
+//		HRESULT hr = S_OK;
+//
+//		DWORD dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
+//#ifdef _DEBUG
+//		// Set the D3DCOMPILE_DEBUG flag to embed debug information in the shaders.
+//		// Setting this flag improves the shader debugging experience, but still allows 
+//		// the shaders to be optimized and to run exactly the way they will run in 
+//		// the release configuration of this program.
+//		dwShaderFlags |= D3DCOMPILE_DEBUG;
+//
+//		// Disable optimizations to further improve shader debugging
+//		dwShaderFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+//#endif
+//
+//		ID3DBlob* pErrorBlob = nullptr;
+//		hr = D3DCompileFromFile(szFileName, nullptr, nullptr, szEntryPoint, szShaderModel,
+//			dwShaderFlags, 0, ppBlobOut, &pErrorBlob);
+//		if (FAILED(hr))
+//		{
+//			if (pErrorBlob)
+//			{
+//				OutputDebugStringA(reinterpret_cast<const char*>(pErrorBlob->GetBufferPointer()));
+//				pErrorBlob->Release();
+//			}
+//			return hr;
+//		}
+//		if (pErrorBlob) pErrorBlob->Release();
+//
+//		return S_OK;
+//	}
 private:
 	D3D_DRIVER_TYPE				m_driverType;
 	D3D_FEATURE_LEVEL			m_featureLevel;
@@ -739,12 +815,14 @@ private:
 	ID3D11PixelShader*			m_pPixelShader;
 	ID3D11InputLayout*			m_pVertexLayout;
 	ID3D11Buffer				*m_pVertexBuffer, *m_pIndexBuffer;
-	ID3D11SamplerState*			m_pSamplerLinear;
+	ID3D11SamplerState*			m_pLinearSampler;
 private:
 	int							m_sourceWidth, m_sourceHeight;
 	int							m_frameIdx, m_frameUpdateCount;
+	HINSTANCE					m_hInst;
 	HWND						m_hWnd;
 	cv::Mat*					m_pMatTmp;
+	bool						m_bCreateDeviceSuccess, m_bAttachSuccess;
 };
 
 
@@ -756,6 +834,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	PAINTSTRUCT ps;
 	HDC hdc;
 
+	CamDrv* pCamDrv = nullptr;
+
 	switch (message)
 	{
 	case WM_PAINT:
@@ -766,6 +846,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_DESTROY:
 		PostQuitMessage(0);
 		break;
+
+	case WM_KEYUP:
+		pCamDrv = reinterpret_cast<CamDrv*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+
+		if ((wParam == VK_NUMPAD2) || (wParam == VK_DOWN))
+		{
+			pCamDrv->DecExposure();
+		}
+		else if ((wParam == VK_NUMPAD2) || (wParam == VK_UP))
+		{
+			pCamDrv->IncExposure();
+		}
+		else if ((wParam == VK_NUMPAD4) || (wParam == VK_LEFT))
+		{
+			pCamDrv->DecFocus();
+		}
+		else if ((wParam == VK_NUMPAD6) || (wParam == VK_RIGHT))
+		{
+			pCamDrv->IncFocus();
+		}
 
 		// Note that this tutorial does not handle resizing (WM_SIZE) requests,
 		// so we created the window without the resize border.
@@ -811,7 +911,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 	
 	// Create window
 	HINSTANCE hInst = hInstance;
-	RECT rc = { 0, 0, 1920, 1080 };
+	RECT rc = { 0, 0, 1280, 720 };
 	AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
 	HWND hWnd = CreateWindow(L"FaceDetectionAppDX11Class", L"Sualab FaceDetectionApp(DX11)",
 		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
@@ -820,8 +920,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 	if (!hWnd)
 		return E_FAIL;
 
+	SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)pCamDrv);
+	
 	// Alloc FaceDetectionAppDX11 obj
-	FaceDetectionAppDX11* pFaceDetectionAppDX11 = new FaceDetectionAppDX11(pCamDrv->GetWidth(), pCamDrv->GetHeight());
+	FaceDetectionAppDX11* pFaceDetectionAppDX11 = new FaceDetectionAppDX11(hInst, pCamDrv->GetWidth(), pCamDrv->GetHeight());
 	if (FAILED(pFaceDetectionAppDX11->Attach(hWnd)))
 		return E_FAIL;
 
@@ -841,7 +943,6 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
 			continue;
 		}
-		
 		pFaceDetectionAppDX11->Render(pCamDrv->GetFrame());
 	}
 
