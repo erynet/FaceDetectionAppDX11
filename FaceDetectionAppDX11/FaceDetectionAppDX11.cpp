@@ -1,20 +1,25 @@
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <mmSystem.h>
-#pragma comment (lib, "Winmm.lib")
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <directxmath.h>
 #include <directxcolors.h>
-
-#include <opencv2/opencv.hpp>
+#pragma comment(lib,"d3d11.lib")
+#pragma comment(lib,"d3dcompiler.lib")
+#pragma comment(lib,"dxguid.lib")
+#pragma comment(lib,"comctl32.lib")
 
 #include "resource.h"
 #include <tchar.h>
 
-#include <numeric>
 #include <vector>
+#include <map>
+
+#include <numeric>
 #include <atomic>
+
+#include "MediaFoundationCamDrv.h"
 
 #define SAFE_FREE(p) if (p != nullptr) { ::free(p); p = nullptr; }
 #define SAFE_DELETE(p) if (p != nullptr) { delete p; p = nullptr; }
@@ -34,11 +39,6 @@ using namespace DirectX;
 //--------------------------------------------------------------------------------------
 // Structures
 //--------------------------------------------------------------------------------------
-struct _FrameLayout
-{
-	int idx;
-	cv::Mat* pMat;
-};
 
 struct _ShmReqLayout
 {
@@ -58,190 +58,240 @@ struct _SimpleVertex
 	XMFLOAT2 Tex;
 };
 
-
-int ___GCD(int n1, int n2) { return (n2 == 0) ? n1 : ___GCD(n2, n1 % n2);}
-
-class CamDrv
+struct _cbMetaData
 {
-public:
-	CamDrv(int devIdx, int evalReqSide, int camMaxWidth = 1920, int camMaxHeight = 1080, double camFps = 30.0)
-		: m_pCap(nullptr)
-		, m_evalReqSide(evalReqSide)
-		, m_hReqShm(NULL)
-		, m_hResShm(NULL)
-		, m_pReqMv(nullptr)
-		, m_pResMv(nullptr)
-		, m_pResBk(nullptr)
-		, m_mmrEvtRetrieve(NULL)
-	{
-		m_pCap = new cv::VideoCapture(devIdx);
-		if ((m_pCap == nullptr) || (!m_pCap->isOpened()))
-			return;
-
-		m_pCap->set(cv::CAP_PROP_FRAME_WIDTH, camMaxWidth);
-		m_pCap->set(cv::CAP_PROP_FRAME_HEIGHT, camMaxHeight);
-		m_pCap->set(cv::CAP_PROP_FPS, camFps);
-		m_pCap->set(cv::CAP_PROP_ZOOM, 0.0);
-		
-		m_hReqShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_REQ_SIZE, _T("__SHM_REQ_IMG"));
-		m_hResShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_RES_SIZE, _T("__SHM_RES_RECT"));
-
-		if ((m_hReqShm == NULL) || (m_hResShm == NULL))
-			return;
-
-		m_pReqMv = ::MapViewOfFile(m_hReqShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_REQ_SIZE);
-		m_pResMv = ::MapViewOfFile(m_hResShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_RES_SIZE);
-
-		if ((m_pReqMv == nullptr) || (m_pResMv == nullptr))
-			return;
-
-		_ShmReqLayout* pShmReq = reinterpret_cast<_ShmReqLayout*>(m_pReqMv);
-		memset(pShmReq->data, 0, SHM_REQ_SIZE);
-		_ShmResLayout* pShmRes = reinterpret_cast<_ShmResLayout*>(m_pResMv);
-		memset(pShmRes->data, 0, SHM_RES_SIZE);
-
-		m_pResBk = static_cast<char*>(::malloc(SHM_RES_SIZE));
-
-		m_camPropHeight = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_HEIGHT));
-		m_camPropWidth = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_WIDTH));
-		m_camPropFPS = m_pCap->get(cv::CAP_PROP_FPS);
-
-		for (int i = 0; i < BUF_SIZE; i++)
-			m_vMatBuf.push_back(new cv::Mat(m_camPropHeight, m_camPropWidth, CV_8UC3));
-
-		m_aiFrameIdx = 0;
-		ZeroMemory(&m_FrameLayout, sizeof(m_FrameLayout));
-	}
-	~CamDrv()
-	{
-		Stop();
-
-		SAFE_DELETE(m_pCap);
-		SAFE_FREE(m_pResBk);
-		SAFE_DELETE_PVECTOR(m_vMatBuf);
-	}
-	bool IsWorking() const
-	{
-		if ((m_pCap == nullptr) || (!m_pCap->isOpened()) ||
-			(m_hReqShm == NULL) || (m_hResShm == NULL) ||
-			(m_pReqMv == nullptr) || (m_pResMv == nullptr) ||
-			(m_vMatBuf.size() == 0))
-			return false;
-		return true;
-	}
-	int GetWidth() const
-	{
-		if (!IsWorking())
-			return 0;
-		return m_camPropWidth;
-	}
-	int GetHeight() const
-	{
-		if (!IsWorking())
-			return 0;
-		return m_camPropHeight;
-	}
-	double GetFPS() const
-	{
-		if (!IsWorking())
-			return 0;
-		return m_camPropFPS;
-	}
-	void IncFocus()
-	{
-		m_pCap->set(cv::CAP_PROP_FOCUS, m_pCap->get(cv::CAP_PROP_FOCUS) + 1.0);
-	}
-	void DecFocus()
-	{
-		m_pCap->set(cv::CAP_PROP_FOCUS, m_pCap->get(cv::CAP_PROP_FOCUS) - 1.0);
-	}
-	void IncExposure()
-	{
-		m_pCap->set(cv::CAP_PROP_EXPOSURE, m_pCap->get(cv::CAP_PROP_EXPOSURE) + 1.0);
-	}
-	void DecExposure()
-	{
-		m_pCap->set(cv::CAP_PROP_EXPOSURE, m_pCap->get(cv::CAP_PROP_EXPOSURE) - 1.0);
-	}
-	const _FrameLayout& GetFrame() const
-	{
-		return m_FrameLayout;
-	}
-public:
-	bool Run()
-	{
-		if (!IsWorking())
-			return false;
-
-		// Initialize multimedia timer
-		TIMECAPS tc;
-		timeGetDevCaps(&tc, sizeof(TIMECAPS));
-		unsigned int mmtRes = MIN(MAX(tc.wPeriodMin, 0), tc.wPeriodMax);
-		timeBeginPeriod(mmtRes);
-
-		double fps = GetFPS();
-
-		m_mmrEvtRetrieve = timeSetEvent(
-			1000 / (fps * 1.01),
-			mmtRes,
-			MMTCB_Retrieve,
-			reinterpret_cast<DWORD_PTR>(this),
-			TIME_PERIODIC);
-
-		if (m_mmrEvtRetrieve == NULL)
-			return false;
-		return true;
-	}
-	
-	void Stop()
-	{
-		if (m_mmrEvtRetrieve != NULL)
-			timeKillEvent(m_mmrEvtRetrieve);
-
-		m_aiFrameIdx = 0;
-		ZeroMemory(&m_FrameLayout, sizeof(m_FrameLayout));
-	}
-private:
-	static void CALLBACK MMTCB_Retrieve(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
-	{
-		CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
-		if (!p->IsWorking())
-			return;
-
-		int curIdx = p->m_aiFrameIdx;
-		int nextSlot = (curIdx + 1) % BUF_SIZE;
-
-		bool bRetSuccess = p->m_pCap->read(*(p->m_vMatBuf[nextSlot]));
-		
-		if (!bRetSuccess)
-			return;
-
-		p->m_aiFrameIdx++;
-
-		p->m_FrameLayout.idx = p->m_aiFrameIdx;
-		p->m_FrameLayout.pMat = p->m_vMatBuf[nextSlot];
-
-		// TO DO
-	}
-private:
-	cv::VideoCapture*		m_pCap;
-	int						m_evalReqSide;
-	int						m_camPropWidth, m_camPropHeight;
-	double					m_camPropFPS;
-	std::vector<cv::Mat*>	m_vMatBuf;
-	std::atomic<int>		m_aiFrameIdx;
-	_FrameLayout			m_FrameLayout;
-private:
-	HANDLE					m_hReqShm, m_hResShm;
-	void					*m_pReqMv, *m_pResMv;
-	char*					m_pResBk;
-	MMRESULT				m_mmrEvtRetrieve;
+	XMFLOAT4	RenderTargetRes;
+	XMFLOAT4	TextureRes;
 };
+
+struct _Tx_Srv_DXGI
+{
+	DXGI_FORMAT TxFmt;
+	DXGI_FORMAT SrvFmt;
+	char		EntryPoint[128];
+
+	_Tx_Srv_DXGI() : TxFmt((DXGI_FORMAT)0), SrvFmt((DXGI_FORMAT)0) {}
+
+	_Tx_Srv_DXGI(DXGI_FORMAT txFmt, DXGI_FORMAT srvFmt, const char* entryPoint)
+		: TxFmt(txFmt)
+		, SrvFmt(srvFmt)
+	{
+		strcpy_s(EntryPoint, entryPoint);
+	}
+};
+
+int ___GCD(int n1, int n2) { return (n2 == 0) ? n1 : ___GCD(n2, n1 % n2); }
+
+//class CamDrv
+//{
+//public:
+//	CamDrv(int devIdx, int evalReqSide, int camMaxWidth = 1920, int camMaxHeight = 1080, double camFps = 30.0)
+//		: m_pCap(nullptr)
+//		, m_evalReqSide(evalReqSide)
+//		, m_hReqShm(NULL)
+//		, m_hResShm(NULL)
+//		, m_pReqMv(nullptr)
+//		, m_pResMv(nullptr)
+//		, m_pResBk(nullptr)
+//		//, m_mmrEvtRetrieve(NULL)
+//	{
+//		m_pCap = new cv::VideoCapture(devIdx);
+//		if ((m_pCap == nullptr) || (!m_pCap->isOpened()))
+//			return;
+//
+//		m_pCap->set(cv::CAP_PROP_FRAME_WIDTH, camMaxWidth);
+//		m_pCap->set(cv::CAP_PROP_FRAME_HEIGHT, camMaxHeight);
+//		m_pCap->set(cv::CAP_PROP_FPS, camFps);
+//		m_pCap->set(cv::CAP_PROP_ZOOM, 0.0);
+//		
+//		m_hReqShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_REQ_SIZE, _T("__SHM_REQ_IMG"));
+//		m_hResShm = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_RES_SIZE, _T("__SHM_RES_RECT"));
+//
+//		if ((m_hReqShm == NULL) || (m_hResShm == NULL))
+//			return;
+//
+//		m_pReqMv = ::MapViewOfFile(m_hReqShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_REQ_SIZE);
+//		m_pResMv = ::MapViewOfFile(m_hResShm, FILE_MAP_ALL_ACCESS, 0, 0, SHM_RES_SIZE);
+//
+//		if ((m_pReqMv == nullptr) || (m_pResMv == nullptr))
+//			return;
+//
+//		_ShmReqLayout* pShmReq = reinterpret_cast<_ShmReqLayout*>(m_pReqMv);
+//		memset(pShmReq->data, 0, SHM_REQ_SIZE);
+//		_ShmResLayout* pShmRes = reinterpret_cast<_ShmResLayout*>(m_pResMv);
+//		memset(pShmRes->data, 0, SHM_RES_SIZE);
+//
+//		m_pResBk = static_cast<char*>(::malloc(SHM_RES_SIZE));
+//
+//		m_camPropHeight = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_HEIGHT));
+//		m_camPropWidth = static_cast<int>(m_pCap->get(cv::CAP_PROP_FRAME_WIDTH));
+//		m_camPropFPS = m_pCap->get(cv::CAP_PROP_FPS);
+//
+//		for (int i = 0; i < BUF_SIZE; i++)
+//			m_vMatBuf.push_back(new cv::Mat(m_camPropHeight, m_camPropWidth, CV_8UC3));
+//
+//		m_aiFrameIdx = 0;
+//		ZeroMemory(&m_FrameLayout, sizeof(m_FrameLayout));
+//	}
+//	~CamDrv()
+//	{
+//		Stop();
+//
+//		SAFE_DELETE(m_pCap);
+//		SAFE_FREE(m_pResBk);
+//		SAFE_DELETE_PVECTOR(m_vMatBuf);
+//	}
+//	bool IsWorking() const
+//	{
+//		if ((m_pCap == nullptr) || (!m_pCap->isOpened()) ||
+//			(m_hReqShm == NULL) || (m_hResShm == NULL) ||
+//			(m_pReqMv == nullptr) || (m_pResMv == nullptr) ||
+//			(m_vMatBuf.size() == 0))
+//			return false;
+//		return true;
+//	}
+//	int GetWidth() const
+//	{
+//		if (!IsWorking())
+//			return 0;
+//		return m_camPropWidth;
+//	}
+//	int GetHeight() const
+//	{
+//		if (!IsWorking())
+//			return 0;
+//		return m_camPropHeight;
+//	}
+//	double GetFPS() const
+//	{
+//		if (!IsWorking())
+//			return 0;
+//		return m_camPropFPS;
+//	}
+//	void IncFocus()
+//	{
+//		m_pCap->set(cv::CAP_PROP_FOCUS, m_pCap->get(cv::CAP_PROP_FOCUS) + 1.0);
+//	}
+//	void DecFocus()
+//	{
+//		m_pCap->set(cv::CAP_PROP_FOCUS, m_pCap->get(cv::CAP_PROP_FOCUS) - 1.0);
+//	}
+//	void IncExposure()
+//	{
+//		m_pCap->set(cv::CAP_PROP_EXPOSURE, m_pCap->get(cv::CAP_PROP_EXPOSURE) + 1.0);
+//	}
+//	void DecExposure()
+//	{
+//		m_pCap->set(cv::CAP_PROP_EXPOSURE, m_pCap->get(cv::CAP_PROP_EXPOSURE) - 1.0);
+//	}
+//	const _FrameLayout& GetFrame() const
+//	{
+//		return m_FrameLayout;
+//	}
+//public:
+//	bool Run()
+//	{
+//		if (!IsWorking())
+//			return false;
+//
+//		//// Initialize multimedia timer
+//		//TIMECAPS tc;
+//		//timeGetDevCaps(&tc, sizeof(TIMECAPS));
+//		//unsigned int mmtRes = MIN(MAX(tc.wPeriodMin, 0), tc.wPeriodMax);
+//		//timeBeginPeriod(mmtRes);
+//
+//		//double fps = GetFPS();
+//
+//		//m_mmrEvtRetrieve = timeSetEvent(
+//		//	1000 / (fps * 1.01),
+//		//	mmtRes,
+//		//	MMTCB_Retrieve,
+//		//	reinterpret_cast<DWORD_PTR>(this),
+//		//	TIME_PERIODIC);
+//
+//		//if (m_mmrEvtRetrieve == NULL)
+//		//	return false;
+//		return true;
+//	}
+//	
+//	void Stop()
+//	{
+//		/*if (m_mmrEvtRetrieve != NULL)
+//			timeKillEvent(m_mmrEvtRetrieve);*/
+//
+//		m_aiFrameIdx = 0;
+//		ZeroMemory(&m_FrameLayout, sizeof(m_FrameLayout));
+//	}
+//private:
+//	static void CALLBACK MMTCB_Retrieve(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
+//	{
+//		CamDrv* p = reinterpret_cast<CamDrv*>(dwUser);
+//		if (!p->IsWorking())
+//			return;
+//
+//		int curIdx = p->m_aiFrameIdx;
+//		int nextSlot = (curIdx + 1) % BUF_SIZE;
+//
+//		bool bRetSuccess = p->m_pCap->read(*(p->m_vMatBuf[nextSlot]));
+//		
+//		if (!bRetSuccess)
+//			return;
+//
+//		p->m_aiFrameIdx++;
+//
+//		p->m_FrameLayout.idx = p->m_aiFrameIdx;
+//		p->m_FrameLayout.pMat = p->m_vMatBuf[nextSlot];
+//
+//		// TO DO
+//	}
+//private:
+//	cv::VideoCapture*		m_pCap;
+//	int						m_evalReqSide;
+//	int						m_camPropWidth, m_camPropHeight;
+//	double					m_camPropFPS;
+//	std::vector<cv::Mat*>	m_vMatBuf;
+//	std::atomic<int>		m_aiFrameIdx;
+//	_FrameLayout			m_FrameLayout;
+//private:
+//	HANDLE					m_hReqShm, m_hResShm;
+//	void					*m_pReqMv, *m_pResMv;
+//	char*					m_pResBk;
+//	//MMRESULT				m_mmrEvtRetrieve;
+//};
 
 class FaceDetectionAppDX11
 {
+private:
+	D3D_DRIVER_TYPE				m_driverType;
+	D3D_FEATURE_LEVEL			m_featureLevel;
+	ID3D11Device*				m_pd3dDevice;
+	ID3D11Device1*				m_pd3dDevice1;
+	ID3D11DeviceContext*		m_pImmediateContext;
+	ID3D11DeviceContext1*		m_pImmediateContext1;
+	IDXGISwapChain*				m_pSwapChain;
+	IDXGISwapChain1*			m_pSwapChain1;
+	ID3D11RenderTargetView*		m_pRenderTargetView;
+	ID3D11Texture2D*            m_pDepthStencil;
+	ID3D11DepthStencilView*     m_pDepthStencilView;
+	ID3D11Texture2D*            m_paTx[2];
+	ID3D11ShaderResourceView*   m_paTxRV[2];
+	ID3D11VertexShader*			m_pVertexShader;
+	ID3D11PixelShader*			m_pPixelShader;
+	ID3D11InputLayout*			m_pVertexLayout;
+	ID3D11Buffer				*m_pVertexBuffer, *m_pIndexBuffer, *m_pMetaDataBuffer;
+	ID3D11SamplerState*			m_pLinearSampler;
+private:
+	int									m_sourceWidth, m_sourceHeight;
+	int									m_texturePixelType, m_textureBytePerPixel;
+	int									m_frameIdx, m_frameUpdateCount;
+	HINSTANCE							m_hInst;
+	HWND								m_hWnd;
+	bool								m_bCreateDeviceSuccess, m_bAttachSuccess;
+	std::map<int, _Tx_Srv_DXGI>			m_mapDxgiTxToSrv;
+private:
+	_cbMetaData							m_CBMeataData;
 public:
-	FaceDetectionAppDX11(HINSTANCE hInstance, int srcWidth, int srcHeight)
+	FaceDetectionAppDX11(HINSTANCE hInstance, int srcWidth, int srcHeight, int texturePixelType, int textureBytePerPixel)
 		: m_driverType(D3D_DRIVER_TYPE_NULL)
 		, m_featureLevel(D3D_FEATURE_LEVEL_11_0)
 		, m_pd3dDevice(nullptr)
@@ -257,14 +307,16 @@ public:
 		, m_pPixelShader(nullptr)
 		, m_pVertexBuffer(nullptr)
 		, m_pIndexBuffer(nullptr)
+		, m_pMetaDataBuffer(nullptr)
 		, m_pLinearSampler(nullptr)
 		, m_sourceWidth(srcWidth)
 		, m_sourceHeight(srcHeight)
+		, m_texturePixelType(texturePixelType)
+		, m_textureBytePerPixel(textureBytePerPixel)
 		, m_frameIdx(0)
 		, m_frameUpdateCount(0)
 		, m_hInst(hInstance)
 		, m_hWnd(NULL)
-		, m_pMatTmp(new cv::Mat(srcHeight, srcWidth, CV_8UC4))
 		, m_bCreateDeviceSuccess(false)
 		, m_bAttachSuccess(false)
 	{
@@ -291,6 +343,13 @@ public:
 			D3D_FEATURE_LEVEL_10_0,
 		};
 		UINT numFeatureLevels = ARRAYSIZE(featureLevels);
+
+		// https://docs.microsoft.com/en-us/windows/desktop/api/dxgiformat/ne-dxgiformat-dxgi_format
+		m_mapDxgiTxToSrv[D3DFMT_A8R8G8B8] = _Tx_Srv_DXGI(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, "PS_ARGBtoRGBA");
+		m_mapDxgiTxToSrv[D3DFMT_X8R8G8B8] = _Tx_Srv_DXGI(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, "PS_XRGBtoRGBA");
+		m_mapDxgiTxToSrv[FCC('YUY2')] = _Tx_Srv_DXGI(DXGI_FORMAT_YUY2, DXGI_FORMAT_R8G8_B8G8_UNORM, "PS_YUY2toRGBA");
+		m_mapDxgiTxToSrv[FCC('AYUV')] = _Tx_Srv_DXGI(DXGI_FORMAT_AYUV, DXGI_FORMAT_R8G8B8A8_UNORM, "PS_AYUVtoRGBA");
+		m_mapDxgiTxToSrv[FCC('NV12')] = _Tx_Srv_DXGI(DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8_UNORM, "PS_NV12toRGBA");
 
 		for (UINT driverTypeIndex = 0; driverTypeIndex < numDriverTypes; driverTypeIndex++)
 		{
@@ -351,7 +410,8 @@ public:
 		// Compile the pixel shader
 		ID3DBlob* pPSBlob = nullptr;
 		//hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", "PS", "ps_4_0", &pPSBlob);
-		hr = CompileShader("PS", "ps_4_0", &pPSBlob);
+		//hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", m_mapDxgiTxToSrv[m_texturePixelType].EntryPoint, "ps_4_0", &pPSBlob);
+		hr = CompileShader(m_mapDxgiTxToSrv[m_texturePixelType].EntryPoint, "ps_4_0", &pPSBlob);
 		if (FAILED(hr))
 		{
 			MessageBox(nullptr,
@@ -385,7 +445,8 @@ public:
 		texDesc.Height = m_sourceHeight;
 		texDesc.MipLevels = 1;
 		texDesc.ArraySize = 1;
-		texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		//texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		texDesc.Format = m_mapDxgiTxToSrv[m_texturePixelType].TxFmt;
 		texDesc.SampleDesc.Count = 1;
 		texDesc.SampleDesc.Quality = 0;
 		texDesc.Usage = D3D11_USAGE_DYNAMIC;
@@ -403,7 +464,8 @@ public:
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
 		ZeroMemory(&srvDesc, sizeof(D3D11_SHADER_RESOURCE_VIEW_DESC));
 		srvDesc.ViewDimension = D3D_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Format = texDesc.Format;
+		//srvDesc.Format = texDesc.Format;
+		srvDesc.Format = m_mapDxgiTxToSrv[m_texturePixelType].SrvFmt;
 		srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
 
 		hr = m_pd3dDevice->CreateShaderResourceView(m_paTx[0], &srvDesc, &(m_paTxRV[0]));
@@ -422,6 +484,7 @@ public:
 
 		SAFE_RELEASE(m_pVertexBuffer);
 		SAFE_RELEASE(m_pIndexBuffer);
+		SAFE_RELEASE(m_pMetaDataBuffer);
 		SAFE_RELEASE(m_pDepthStencil);
 		SAFE_RELEASE(m_pDepthStencilView);
 		SAFE_RELEASE(m_pRenderTargetView);
@@ -446,7 +509,7 @@ public:
 		SAFE_RELEASE(m_pd3dDevice);
 
 		m_hWnd = NULL;
-		SAFE_DELETE(m_pMatTmp);
+		//SAFE_DELETE(m_pMatTmp);
 	}
 	HRESULT Attach(HWND hWnd)
 	{
@@ -628,23 +691,27 @@ public:
 			{ XMFLOAT3(1.0f - wMargin, -1.0f + hMargin, 1.0f), XMFLOAT2(1.0f, 1.0f) },
 		};
 
+		//// VERTEX BUFFER
+
 		D3D11_BUFFER_DESC bd;
+		D3D11_SUBRESOURCE_DATA sd;
+
 		ZeroMemory(&bd, sizeof(bd));
+		ZeroMemory(&sd, sizeof(sd));
 		bd.Usage = D3D11_USAGE_DEFAULT;
 		bd.ByteWidth = sizeof(_SimpleVertex) * 6;
 		bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
 		bd.CPUAccessFlags = 0;
-		D3D11_SUBRESOURCE_DATA InitData;
-		ZeroMemory(&InitData, sizeof(InitData));
-		InitData.pSysMem = vertices;
-		hr = m_pd3dDevice->CreateBuffer(&bd, &InitData, &m_pVertexBuffer);
+		sd.pSysMem = vertices;
+		hr = m_pd3dDevice->CreateBuffer(&bd, &sd, &m_pVertexBuffer);
 		if (FAILED(hr))
 			return hr;
-
 		// Set vertex buffer
 		UINT stride = sizeof(_SimpleVertex);
 		UINT offset = 0;
 		m_pImmediateContext->IASetVertexBuffers(0, 1, &m_pVertexBuffer, &stride, &offset);
+
+		//// INDEX BUFFER
 
 		WORD indices[] =
 		{
@@ -652,17 +719,38 @@ public:
 			1,3,2,
 		};
 
+		ZeroMemory(&bd, sizeof(bd));
+		ZeroMemory(&sd, sizeof(sd));
 		bd.Usage = D3D11_USAGE_DEFAULT;
 		bd.ByteWidth = sizeof(WORD) * 6;
 		bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
 		bd.CPUAccessFlags = 0;
-		InitData.pSysMem = indices;
-		hr = m_pd3dDevice->CreateBuffer(&bd, &InitData, &m_pIndexBuffer);
+		sd.pSysMem = indices;
+		hr = m_pd3dDevice->CreateBuffer(&bd, &sd, &m_pIndexBuffer);
 		if (FAILED(hr))
 			return hr;
-
-		// Set index buffe
+		// Set index buffer
 		m_pImmediateContext->IASetIndexBuffer(m_pIndexBuffer, DXGI_FORMAT_R16_UINT, 0);
+
+		//// cbMetaData BUFFER
+
+		m_CBMeataData.RenderTargetRes.x = (float)renderWidth;
+		m_CBMeataData.RenderTargetRes.y = (float)renderHeight;
+		m_CBMeataData.TextureRes.x = (float)m_sourceWidth;
+		m_CBMeataData.TextureRes.y = (float)m_sourceHeight;
+
+		ZeroMemory(&bd, sizeof(bd));
+		ZeroMemory(&sd, sizeof(sd));
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.ByteWidth = sizeof(_cbMetaData);
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = 0;
+		sd.pSysMem = &m_CBMeataData;
+		hr = m_pd3dDevice->CreateBuffer(&bd, &sd, &m_pMetaDataBuffer);
+		if (FAILED(hr))
+			return hr;
+		// Set buffer
+		//m_pImmediateContext->UpdateSubresource(m_pMetaDataBuffer, 0, nullptr, &m_CBMeataData, 0, 0);
 
 		// Set primitive topology
 		m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -687,17 +775,9 @@ public:
 		if (!m_bAttachSuccess)
 			return;
 
-		if (frame.pMat == nullptr)
-			return;
-
 		if (frame.idx > m_frameIdx)
 		{
-			unsigned char* pSrc = frame.pMat->data;
-			if (frame.pMat->type() == CV_8UC3)
-			{
-				cv::cvtColor(*(frame.pMat), *m_pMatTmp, CV_BGR2BGRA);
-				pSrc = m_pMatTmp->data;
-			}
+			unsigned char* pSrc = reinterpret_cast<unsigned char*>(frame.pData);
 			m_frameIdx = frame.idx;
 			m_frameUpdateCount++;
 
@@ -706,7 +786,7 @@ public:
 			HRESULT hr = m_pImmediateContext->Map(m_paTx[m_frameUpdateCount % 2], 0, D3D11_MAP_WRITE_DISCARD, 0, &mapTx);
 			if (SUCCEEDED(hr))
 			{
-				memcpy(mapTx.pData, pSrc, (m_sourceWidth * m_sourceHeight * 4));
+				memcpy(mapTx.pData, pSrc, (m_sourceWidth * m_sourceHeight * m_textureBytePerPixel));
 				m_pImmediateContext->Unmap(m_paTx[m_frameUpdateCount % 2], 0);
 			}
 		}
@@ -715,7 +795,7 @@ public:
 		m_pImmediateContext->ClearRenderTargetView(m_pRenderTargetView, Colors::Black);
 
 		// Clear the depth buffer to 1.0 (max depth)
-		m_pImmediateContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
+		//m_pImmediateContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
 
 		m_pImmediateContext->PSSetShaderResources(0, 1, &(m_paTxRV[m_frameUpdateCount % 2]));
 
@@ -723,6 +803,7 @@ public:
 		m_pImmediateContext->VSSetShader(m_pVertexShader, nullptr, 0);
 		m_pImmediateContext->PSSetShader(m_pPixelShader, nullptr, 0);
 		m_pImmediateContext->PSSetSamplers(0, 1, &m_pLinearSampler);
+		m_pImmediateContext->PSSetConstantBuffers(0, 1, &m_pMetaDataBuffer);
 		m_pImmediateContext->DrawIndexed(6, 0, 0);
 
 		// Present the information rendered to the back buffer to the front buffer (the screen)
@@ -765,64 +846,38 @@ private:
 
 		return S_OK;
 	}
-//	HRESULT CompileShaderFromFile(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
-//	{
-//		HRESULT hr = S_OK;
-//
-//		DWORD dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
-//#ifdef _DEBUG
-//		// Set the D3DCOMPILE_DEBUG flag to embed debug information in the shaders.
-//		// Setting this flag improves the shader debugging experience, but still allows 
-//		// the shaders to be optimized and to run exactly the way they will run in 
-//		// the release configuration of this program.
-//		dwShaderFlags |= D3DCOMPILE_DEBUG;
-//
-//		// Disable optimizations to further improve shader debugging
-//		dwShaderFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
-//#endif
-//
-//		ID3DBlob* pErrorBlob = nullptr;
-//		hr = D3DCompileFromFile(szFileName, nullptr, nullptr, szEntryPoint, szShaderModel,
-//			dwShaderFlags, 0, ppBlobOut, &pErrorBlob);
-//		if (FAILED(hr))
-//		{
-//			if (pErrorBlob)
-//			{
-//				OutputDebugStringA(reinterpret_cast<const char*>(pErrorBlob->GetBufferPointer()));
-//				pErrorBlob->Release();
-//			}
-//			return hr;
-//		}
-//		if (pErrorBlob) pErrorBlob->Release();
-//
-//		return S_OK;
-//	}
-private:
-	D3D_DRIVER_TYPE				m_driverType;
-	D3D_FEATURE_LEVEL			m_featureLevel;
-	ID3D11Device*				m_pd3dDevice;
-	ID3D11Device1*				m_pd3dDevice1;
-	ID3D11DeviceContext*		m_pImmediateContext;
-	ID3D11DeviceContext1*		m_pImmediateContext1;
-	IDXGISwapChain*				m_pSwapChain;
-	IDXGISwapChain1*			m_pSwapChain1;
-	ID3D11RenderTargetView*		m_pRenderTargetView;
-	ID3D11Texture2D*            m_pDepthStencil;
-	ID3D11DepthStencilView*     m_pDepthStencilView;
-	ID3D11Texture2D*            m_paTx[2];
-	ID3D11ShaderResourceView*   m_paTxRV[2];
-	ID3D11VertexShader*			m_pVertexShader;
-	ID3D11PixelShader*			m_pPixelShader;
-	ID3D11InputLayout*			m_pVertexLayout;
-	ID3D11Buffer				*m_pVertexBuffer, *m_pIndexBuffer;
-	ID3D11SamplerState*			m_pLinearSampler;
-private:
-	int							m_sourceWidth, m_sourceHeight;
-	int							m_frameIdx, m_frameUpdateCount;
-	HINSTANCE					m_hInst;
-	HWND						m_hWnd;
-	cv::Mat*					m_pMatTmp;
-	bool						m_bCreateDeviceSuccess, m_bAttachSuccess;
+	HRESULT CompileShaderFromFile(WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
+	{
+		HRESULT hr = S_OK;
+
+		DWORD dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
+#ifdef _DEBUG
+		// Set the D3DCOMPILE_DEBUG flag to embed debug information in the shaders.
+		// Setting this flag improves the shader debugging experience, but still allows 
+		// the shaders to be optimized and to run exactly the way they will run in 
+		// the release configuration of this program.
+		dwShaderFlags |= D3DCOMPILE_DEBUG;
+
+		// Disable optimizations to further improve shader debugging
+		dwShaderFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+		ID3DBlob* pErrorBlob = nullptr;
+		hr = D3DCompileFromFile(szFileName, nullptr, nullptr, szEntryPoint, szShaderModel,
+			dwShaderFlags, 0, ppBlobOut, &pErrorBlob);
+		if (FAILED(hr))
+		{
+			if (pErrorBlob)
+			{
+				OutputDebugStringA(reinterpret_cast<const char*>(pErrorBlob->GetBufferPointer()));
+				pErrorBlob->Release();
+			}
+			return hr;
+		}
+		if (pErrorBlob) pErrorBlob->Release();
+
+		return S_OK;
+	}
 };
 
 
@@ -834,7 +889,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	PAINTSTRUCT ps;
 	HDC hdc;
 
-	CamDrv* pCamDrv = nullptr;
+	MediaFoundationCamDrv* pMediaFoundationCamDrv = nullptr;
 
 	switch (message)
 	{
@@ -848,23 +903,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_KEYUP:
-		pCamDrv = reinterpret_cast<CamDrv*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+		pMediaFoundationCamDrv = reinterpret_cast<MediaFoundationCamDrv*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
 
 		if ((wParam == VK_NUMPAD2) || (wParam == VK_DOWN))
 		{
-			pCamDrv->DecExposure();
+			pMediaFoundationCamDrv->DecExposure();
 		}
 		else if ((wParam == VK_NUMPAD2) || (wParam == VK_UP))
 		{
-			pCamDrv->IncExposure();
+			pMediaFoundationCamDrv->IncExposure();
 		}
 		else if ((wParam == VK_NUMPAD4) || (wParam == VK_LEFT))
 		{
-			pCamDrv->DecFocus();
+			pMediaFoundationCamDrv->DecFocus();
 		}
 		else if ((wParam == VK_NUMPAD6) || (wParam == VK_RIGHT))
 		{
-			pCamDrv->IncFocus();
+			pMediaFoundationCamDrv->IncFocus();
 		}
 
 		// Note that this tutorial does not handle resizing (WM_SIZE) requests,
@@ -905,30 +960,31 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 		return E_FAIL;
 
 	// Check & Initialize WebCam
-	CamDrv* pCamDrv = new CamDrv(0, 320);
-	if (!pCamDrv->IsWorking())
+	MediaFoundationCamDrv* pMediaFoundationCamDrv = new MediaFoundationCamDrv(0, 320, 1920, 1080, 30000, 1000);
+	if (!pMediaFoundationCamDrv->IsWorking())
 		return E_FAIL;
 	
 	// Create window
 	HINSTANCE hInst = hInstance;
-	RECT rc = { 0, 0, 1280, 720 };
+	RECT rc = { 0, 0, 1920, 1080 };
 	AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-	HWND hWnd = CreateWindow(L"FaceDetectionAppDX11Class", L"Sualab FaceDetectionApp(DX11)",
+	HWND hWnd = CreateWindow(L"FaceDetectionAppDX11Class", pMediaFoundationCamDrv->GetDevName()/*L"Sualab FaceDetectionApp(DX11)"*/,
 		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
 		CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, hInstance,
 		nullptr);
 	if (!hWnd)
 		return E_FAIL;
 
-	SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)pCamDrv);
+	SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)pMediaFoundationCamDrv);
 	
 	// Alloc FaceDetectionAppDX11 obj
-	FaceDetectionAppDX11* pFaceDetectionAppDX11 = new FaceDetectionAppDX11(hInst, pCamDrv->GetWidth(), pCamDrv->GetHeight());
+	FaceDetectionAppDX11* pFaceDetectionAppDX11 = new FaceDetectionAppDX11(hInst, pMediaFoundationCamDrv->GetWidth(), pMediaFoundationCamDrv->GetHeight(), 
+		pMediaFoundationCamDrv->GetPixelType(), pMediaFoundationCamDrv->GetBytePerPixel());
 	if (FAILED(pFaceDetectionAppDX11->Attach(hWnd)))
 		return E_FAIL;
 
-	if (!pCamDrv->Run())
-		return E_FAIL;
+	//if (!pCamDrv->Run())
+	//	return E_FAIL;
 
 	ShowWindow(hWnd, nCmdShow);
 
@@ -943,15 +999,15 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
 			continue;
 		}
-		pFaceDetectionAppDX11->Render(pCamDrv->GetFrame());
+		pFaceDetectionAppDX11->Render(pMediaFoundationCamDrv->GetFrame());
 	}
 
 	// Dealloc FaceDetectionAppDX11 obj
 	// CleanUp WebCam
-	pCamDrv->Stop();
+	//pCamDrv->Stop();
 
 	SAFE_DELETE(pFaceDetectionAppDX11);
-	SAFE_DELETE(pCamDrv);
+	SAFE_DELETE(pMediaFoundationCamDrv);
 
 	return (int)msg.wParam;
 }
