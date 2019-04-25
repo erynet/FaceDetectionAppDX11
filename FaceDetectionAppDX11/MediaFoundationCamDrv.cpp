@@ -87,13 +87,6 @@ HRESULT MediaFoundationCamDrv::OnReadSample(HRESULT status, DWORD, DWORD, LONGLO
 				BYTE* data;
 				mediaBuffer->Lock(&data, NULL, NULL);
 				CopyMemory(m_frameLayout.pData, data, m_width*m_height*m_bytePerPixel);
-				/*if (m_frameLayout.idx == 0)
-				{
-					FILE* fp = fopen("sample.yuy2", "wb");
-					fwrite(m_frameLayout.pData, m_width*m_height*m_bytePerPixel, 1, fp);
-					fflush(fp);
-					fclose(fp);
-				}*/
 				InterlockedIncrement(&m_frameLayout.idx);
 				mediaBuffer->Release();
 			}
@@ -215,82 +208,6 @@ MediaFoundationCamDrv::~MediaFoundationCamDrv()
 	DeleteCriticalSection(&m_cs);
 }
 
-//HRESULT MediaFoundationCamDrv::CreateCaptureDevice()
-//{
-//	HRESULT hr = S_OK;
-//
-//	//this is important!!
-//	hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-//
-//	UINT32 count = 0;
-//	IMFAttributes *attributes = NULL;
-//	IMFActivate **devices = NULL;
-//
-//	goto CLEAN_ATTR;
-//
-//	if (FAILED(hr)) { goto CLEAN_ATTR; }
-//	// Create an attribute store to specify enumeration parameters.
-//	hr = MFCreateAttributes(&attributes, 1);
-//
-//	if (FAILED(hr)) { goto CLEAN_ATTR; }
-//
-//	//The attribute to be requested is devices that can capture video
-//	hr = attributes->SetGUID(
-//		MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-//		MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
-//	);
-//	if (FAILED(hr)) { goto CLEAN_ATTR; }
-//	//Enummerate the video capture devices
-//	hr = MFEnumDeviceSources(attributes, &devices, &count);
-//
-//	if (FAILED(hr)) { goto CLEAN_ATTR; }
-//	//if there are any available devices
-//	if (count > 0)
-//	{
-//		/*If you actually need to select one of the available devices
-//		this is the place to do it. For this example the first device
-//		is selected
-//		*/
-//		//Get a source reader from the first available device
-//		SetSourceReader(devices[0]);
-//
-//		WCHAR *nameString = NULL;
-//		// Get the human-friendly name of the device
-//		UINT32 cchName;
-//		hr = devices[0]->GetAllocatedString(
-//			MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-//			&nameString, &cchName);
-//
-//		if (SUCCEEDED(hr))
-//		{
-//			//allocate a byte buffer for the raw pixel data
-//			bytesPerPixel = abs(stride) / width;
-//			rawData = new BYTE[width*height * bytesPerPixel];
-//			wcscpy(deviceNameString, nameString);
-//		}
-//		CoTaskMemFree(nameString);
-//	}
-//
-//CLEAN_ATTR:
-//	// clean
-//	if (attributes)
-//	{
-//		attributes->Release();
-//		attributes = NULL;
-//	}
-//	for (DWORD i = 0; i < count; i++)
-//	{
-//		if (&devices[i])
-//		{
-//			devices[i]->Release();
-//			devices[i] = NULL;
-//		}
-//	}
-//	CoTaskMemFree(devices);
-//	return hr;
-//}
-
-
 HRESULT MediaFoundationCamDrv::SetSourceReader(IMFActivate *device)
 {
 	HRESULT hr = S_OK;
@@ -408,7 +325,6 @@ HRESULT MediaFoundationCamDrv::SetSourceReader(IMFActivate *device)
 
 	if (source) { source->Release(); source = NULL; }
 	if (attributes) { attributes->Release(); attributes = NULL; }
-	//if (mediaType) { mediaType->Release(); mediaType = NULL; }
 
 	LeaveCriticalSection(&m_cs);
 
@@ -427,103 +343,10 @@ bool MediaFoundationCamDrv::IsFOURCCSupported(GUID* fourcc, int* mediaType)
 		*mediaType = D3DFMT_X8R8G8B8;
 	else if (*fourcc == MFVideoFormat_ARGB32)
 		*mediaType = D3DFMT_A8R8G8B8;
-	/*else if (*fourcc == MFVideoFormat_Y210)
-		*mediaType = FCC('Y210');
-	else if (*fourcc == MFVideoFormat_Y216)
-		*mediaType = FCC('Y216');
-	else if (*fourcc == MFVideoFormat_Y410)
-		*mediaType = FCC('Y410');
-	else if (*fourcc == MFVideoFormat_Y416)
-		*mediaType = FCC('Y416');*/
 	else
 		return false;
 	return true;
 }
-
-//HRESULT MediaFoundationCamDrv::IsMediaTypeSupported(IMFMediaType *pType)
-//{
-//	HRESULT hr = S_OK;
-//
-//	BOOL bFound = FALSE;
-//	GUID subtype = { 0 };
-//
-//	//Get the stride for this format so we can calculate the number of bytes per pixel
-//	MediaFoundationCamDrv::GetSourceStride(pType, &m_stride);
-//
-//	if (FAILED(hr)) { return hr; }
-//	hr = pType->GetGUID(MF_MT_SUBTYPE, &subtype);
-//
-//	m_videoFormat = subtype;
-//
-//	if (FAILED(hr)) { return hr; }
-//
-//	// DXGI_FORMAT_YUY2 == MFVideoFormat_YUY2, 107
-//	// DXGI_FORMAT_AYUV == MFVideoFormat_AYUV, 100
-//	// DXGI_FORMAT_NV12 == MFVideoFormat_NV12, 103
-//	// DXGI_FORMAT_R8G8B8A8_UNORM == MFVideoFormat_ARGB32, 28
-//	// DXGI_FORMAT_B8G8R8A8_UNORM == MFVideoFormat_ARGB32, 87
-//	// DXGI_FORMAT_B8G8R8X8_UNORM == MFVideoFormat_RGB32, 88
-//	// DXGI_FORMAT_Y210 = MFVideoFormat_Y210, 108
-//	// DXGI_FORMAT_Y216 = MFVideoFormat_Y216, 109
-//	// DXGI_FORMAT_Y410 = MFVideoFormat_Y410, 101
-//	// DXGI_FORMAT_Y416 = MFVideoFormat_Y416, 102
-//
-//	if (subtype == MFVideoFormat_YUY2)
-//		m_dxgiFormat = 107;
-//	else if (subtype == MFVideoFormat_AYUV)
-//		m_dxgiFormat = 100;
-//	else if (subtype == MFVideoFormat_NV12)
-//		m_dxgiFormat = 103;
-//	else if (subtype == MFVideoFormat_RGB32)
-//		m_dxgiFormat = 88;
-//	else if (subtype == MFVideoFormat_ARGB32)
-//		m_dxgiFormat = 87;
-//	else if (subtype == MFVideoFormat_Y210)
-//		m_dxgiFormat = 108;
-//	else if (subtype == MFVideoFormat_Y216)
-//		m_dxgiFormat = 109;
-//	else if (subtype == MFVideoFormat_Y410)
-//		m_dxgiFormat = 101;
-//	else if (subtype == MFVideoFormat_Y416)
-//		m_dxgiFormat = 102;
-//	else
-//		return hr;
-//
-//	return S_OK;
-//}
-//
-////Calculates the default stride based on the format and size of the frames
-//HRESULT MediaFoundationCamDrv::GetSourceStride(IMFMediaType *type, LONG *stride)
-//{
-//	LONG tempStride = 0;
-//
-//	// Try to get the default stride from the media type.
-//	HRESULT hr = type->GetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32*)&tempStride);
-//	if (FAILED(hr))
-//	{
-//		//Setting this atribute to NULL we can obtain the default stride
-//		GUID subtype = GUID_NULL;
-//
-//		UINT32 width = 0;
-//		UINT32 height = 0;
-//
-//		// Obtain the subtype
-//		hr = type->GetGUID(MF_MT_SUBTYPE, &subtype);
-//		//obtain the width and height
-//		if (SUCCEEDED(hr))
-//			hr = MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
-//		//Calculate the stride based on the subtype and width
-//		if (SUCCEEDED(hr))
-//			hr = MFGetStrideForBitmapInfoHeader(subtype.Data1, width, &tempStride);
-//		// set the attribute so it can be read
-//		if (SUCCEEDED(hr))
-//			(void)type->SetUINT32(MF_MT_DEFAULT_STRIDE, UINT32(tempStride));
-//	}
-//
-//	if (SUCCEEDED(hr))
-//		*stride = tempStride;
-//	return hr;
-//}
 
 HRESULT MediaFoundationCamDrv::Close()
 {

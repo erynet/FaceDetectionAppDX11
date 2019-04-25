@@ -21,7 +21,6 @@ struct _FrameLayout
 	void* pData;
 };
 
-
 class MediaFoundationCamDrv : public IMFSourceReaderCallback //this class inhertis from IMFSourceReaderCallback
 {
 public:
@@ -53,11 +52,8 @@ public:
 	MediaFoundationCamDrv(int devIdx, int evalReqSide, UINT camMaxWidth, UINT camMaxHeight, UINT32 camFpsNumerator, UINT32 camFpsDenominator);
 	~MediaFoundationCamDrv();
 private:
-	//HRESULT CreateCaptureDevice();
 	HRESULT SetSourceReader(IMFActivate *device);
 	bool IsFOURCCSupported(GUID* fourcc, int* dxgiFormat);
-	//HRESULT IsMediaTypeSupported(IMFMediaType* type);
-	//HRESULT GetSourceStride(IMFMediaType *pType, LONG *plStride);
 	HRESULT Close();
 public:
 	bool IsWorking() const;

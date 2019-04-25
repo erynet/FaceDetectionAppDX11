@@ -409,7 +409,6 @@ public:
 
 		// Compile the pixel shader
 		ID3DBlob* pPSBlob = nullptr;
-		//hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", "PS", "ps_4_0", &pPSBlob);
 		//hr = CompileShaderFromFile(L"FaceDetectionAppDX11.fx", m_mapDxgiTxToSrv[m_texturePixelType].EntryPoint, "ps_4_0", &pPSBlob);
 		hr = CompileShader(m_mapDxgiTxToSrv[m_texturePixelType].EntryPoint, "ps_4_0", &pPSBlob);
 		if (FAILED(hr))
@@ -509,7 +508,6 @@ public:
 		SAFE_RELEASE(m_pd3dDevice);
 
 		m_hWnd = NULL;
-		//SAFE_DELETE(m_pMatTmp);
 	}
 	HRESULT Attach(HWND hWnd)
 	{
@@ -983,9 +981,6 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 	if (FAILED(pFaceDetectionAppDX11->Attach(hWnd)))
 		return E_FAIL;
 
-	//if (!pCamDrv->Run())
-	//	return E_FAIL;
-
 	ShowWindow(hWnd, nCmdShow);
 
 	// Main message loop
@@ -1004,8 +999,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
 	// Dealloc FaceDetectionAppDX11 obj
 	// CleanUp WebCam
-	//pCamDrv->Stop();
-
+	
 	SAFE_DELETE(pFaceDetectionAppDX11);
 	SAFE_DELETE(pMediaFoundationCamDrv);
 
